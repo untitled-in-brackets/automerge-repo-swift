@@ -160,6 +160,10 @@ extension NetworkSubsystem: NetworkEventReceiver {
                 await repo.handleRequest(msg: requestMsg)
             case let .sync(syncMsg):
                 await repo.handleSync(msg: syncMsg)
+                // a delivered document no longer has a fetch outstanding
+                if let docId = DocumentId(syncMsg.documentId) {
+                    requestedDocuments.removeValue(forKey: docId)
+                }
             case let .unavailable(unavailableMsg):
                 guard let docId = DocumentId(unavailableMsg.documentId) else {
                     Logger.network
