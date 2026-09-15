@@ -376,15 +376,12 @@ public final class WebSocketProvider: NetworkProvider {
         var reconnectAttempts: UInt = 0
         var tryToReconnect = config.reconnectOnError
 
+        // disconnect() tears the connection down before cancelling this task, and connect() may have
+        // peered a new socket since. Once cancelled, the provider's state is no longer this loop's to touch.
         repeat {
             msgFromWebSocket = nil
 
-            // co-operative cancellation
             if Task.isCancelled {
-                webSocketTask?.cancel()
-                webSocketTask = nil
-                peered = false
-                tryToReconnect = false
                 break
             }
 
@@ -411,7 +408,7 @@ public final class WebSocketProvider: NetworkProvider {
                 do {
                     // Wait to reconnect. Wait for waitBeforeReconnect and networth path
                     // transitioning from not satisfied to satisfied. Whichever comes first.
-                    let success = try await withThrowingTaskGroup(of: Void.self) { group in
+                    try await withThrowingTaskGroup(of: Void.self) { group in
 
                         // Wait for timeout
                         group.addTask {
@@ -433,34 +430,34 @@ public final class WebSocketProvider: NetworkProvider {
                             }
                         }
 
-                        // After either task succeeds then cancel group and attempt connection
-                        for try await _ in group {
-                            group.cancelAll()
-                            return try await attemptConnect(to: endpoint)
-                        }
-
-                        return false
+                        try await group.next()
+                        group.cancelAll()
                     }
 
-                    if success {
+                    if Task.isCancelled {
+                        break
+                    }
+
+                    // The wait suspended this actor, so connect() may have peered in the meantime.
+                    if !peered, try await attemptConnect(to: endpoint) {
                         // On successful connection reset connection attemtps
                         reconnectAttempts = 0
                     }
                 } catch {
+                    if Task.isCancelled {
+                        break
+                    }
                     webSocketTask = nil
                     peered = false
                 }
             }
 
-            // co-operative cancellation
-            if Task.isCancelled {
-                tryToReconnect = false
-                break
-            }
-
             do {
                 msgFromWebSocket = try await webSocketTask?.receive()
             } catch {
+                if Task.isCancelled {
+                    break
+                }
                 // error scenario with the WebSocket connection
                 Logger.websocket.warning("WEBSOCKET: Error reading websocket: \(error.localizedDescription)")
                 _statePublisher.send(.disconnected)
@@ -486,10 +483,12 @@ public final class WebSocketProvider: NetworkProvider {
             }
         } while tryToReconnect
 
-        self.peered = false
-        webSocketTask?.cancel()
-        webSocketTask = nil
-        _statePublisher.send(.disconnected)
+        if !Task.isCancelled {
+            peered = false
+            webSocketTask?.cancel()
+            webSocketTask = nil
+            _statePublisher.send(.disconnected)
+        }
         Logger.websocket.warning("WEBSOCKET: receive and reconnect loop terminated")
     }
 
