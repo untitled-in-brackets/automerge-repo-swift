@@ -334,6 +334,15 @@ public final class Repo {
         if logLevel(.repo).canTrace() {
             Logger.repo.trace("REPO: \(self.peerId) adding peer \(peer)")
         }
+        // A sync state belongs to one connection. Keep the shared heads but drop what the previous
+        // connection had in flight, or generateSyncMessage decides the peer is already up to date
+        // and a reconnect to a passive peer sends nothing. Mirrors the encode/decode round-trip in
+        // automerge-repo's DocSynchronizer.beginSync.
+        for handle in handles.values {
+            if let stale = handle.syncStates[peer] {
+                handle.syncStates[peer] = (try? SyncState(bytes: stale.encode())) ?? SyncState()
+            }
+        }
         for docId in documentIds() {
             await beginSync(docId: docId, to: peer)
         }
