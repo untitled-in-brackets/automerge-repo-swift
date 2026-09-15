@@ -376,11 +376,10 @@ public final class WebSocketProvider: NetworkProvider {
         var reconnectAttempts: UInt = 0
         var tryToReconnect = config.reconnectOnError
 
-        // disconnect() tears the connection down before cancelling this task, and connect() may have
-        // peered a new socket since. Once cancelled, the provider's state is no longer this loop's to touch.
         repeat {
             msgFromWebSocket = nil
 
+            // disconnect() already reset state before cancelling; connect() may have re-peered since
             if Task.isCancelled {
                 break
             }
@@ -433,14 +432,12 @@ public final class WebSocketProvider: NetworkProvider {
                         try await group.next()
                         group.cancelAll()
                     }
+                    try Task.checkCancellation()
 
-                    if Task.isCancelled {
-                        break
-                    }
-
-                    // The wait suspended this actor, so connect() may have peered in the meantime.
-                    if !peered, try await attemptConnect(to: endpoint) {
-                        // On successful connection reset connection attemtps
+                    // the wait suspended this actor, so connect() may have peered meanwhile
+                    if peered {
+                        reconnectAttempts = 0
+                    } else if try await attemptConnect(to: endpoint) {
                         reconnectAttempts = 0
                     }
                 } catch {
