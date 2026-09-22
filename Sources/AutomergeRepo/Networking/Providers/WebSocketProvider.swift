@@ -42,6 +42,9 @@ public final class WebSocketProvider: NetworkProvider {
         _statePublisher.value
     }
 
+    /// The refusal that stopped the provider, once it has stopped for one; nil while it may still connect.
+    public private(set) var lastRejection: Errors.ConnectionRejected?
+
     /// A publisher that provides state updates for the WebSocket connection.
     ///
     /// The initial value provides the current state of the connecting in the WebSocket provider,
@@ -108,6 +111,7 @@ public final class WebSocketProvider: NetworkProvider {
         }
 
         endpoint = makeRequest
+        lastRejection = nil
         do {
             let request = try await makeRequest()
             guard try await attemptConnect(to: request) else {
@@ -122,6 +126,7 @@ public final class WebSocketProvider: NetworkProvider {
         } catch {
             guard config.reconnectOnError, Self.isRetryable(error), !Task.isCancelled else {
                 endpoint = nil
+                lastRejection = error as? Errors.ConnectionRejected
                 _statePublisher.send(.disconnected)
                 throw error
             }
@@ -475,6 +480,7 @@ public final class WebSocketProvider: NetworkProvider {
                         break
                     }
                     Logger.websocket.error("WEBSOCKET: refused with HTTP \(rejection.statusCode); not retrying")
+                    lastRejection = rejection
                     break
                 } catch {
                     if Task.isCancelled {
