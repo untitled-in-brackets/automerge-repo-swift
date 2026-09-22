@@ -31,6 +31,8 @@ public final class WebSocketProvider: NetworkProvider {
 
     /// A connection that held at least this long earns a fresh backoff schedule when it drops.
     static let stableConnectionDuration: Duration = .seconds(30)
+    /// The longest wait between reconnection attempts.
+    static let maximumReconnectDelaySeconds = 30
 
     private let _statePublisher: CurrentValueSubject<WebSocketProviderState, Never> =
         CurrentValueSubject(.disconnected)
@@ -82,13 +84,22 @@ public final class WebSocketProvider: NetworkProvider {
     /// `Authorization` header it sets is never replayed after it expires. An error it throws counts as a
     /// failed attempt.
     ///
-    /// Throws when the first attempt fails, unless the configuration has `retryInitialConnect` and the
-    /// failure is one a retry could fix: the provider then keeps trying in the background and reports
-    /// ``WebSocketProviderState/reconnecting``.
+    /// With `reconnectOnError`, a first attempt that fails in a way a retry could fix is treated like any
+    /// other drop: the provider keeps trying in the background and reports
+    /// ``WebSocketProviderState/reconnecting``. Otherwise a failed first attempt throws. Calling this
+    /// while a reconnection is pending attempts immediately instead of waiting out the backoff; while
+    /// peered or mid-handshake it does nothing.
     public func connect(to makeRequest: @escaping @Sendable () async throws -> URLRequest) async throws {
-        if peered {
-            Logger.websocket.error("Attempting to connect while already peered")
-            throw Errors.NetworkProviderError(msg: "Attempting to connect while already peered")
+        switch state {
+        case .ready, .connected:
+            Logger.websocket.info("WEBSOCKET: connect ignored, already \(String(describing: self.state), privacy: .public)")
+            return
+        case .reconnecting:
+            // the loop only touches state once it has confirmed it wasn't cancelled
+            ongoingReceiveMessageTask?.cancel()
+            ongoingReceiveMessageTask = nil
+        case .disconnected:
+            break
         }
 
         guard peerId != nil, delegate != nil else {
@@ -109,7 +120,7 @@ public final class WebSocketProvider: NetworkProvider {
                 Logger.websocket.trace("WEBSOCKET: connected to \(url)")
             }
         } catch {
-            guard config.retryInitialConnect, Self.isRetryable(error), !Task.isCancelled else {
+            guard config.reconnectOnError, Self.isRetryable(error), !Task.isCancelled else {
                 endpoint = nil
                 _statePublisher.send(.disconnected)
                 throw error
@@ -336,15 +347,13 @@ public final class WebSocketProvider: NetworkProvider {
                 Logger.websocket.trace("WEBSOCKET: Peered to targetId: \(peerMsg.senderId) \(peerMsg.debugDescription)")
             }
         } catch {
-            // Reconnection, and the state that goes with it, is decided by the caller: don't touch
-            // the endpoint or publish here.
+            // Only this attempt's socket is ours to clean up; shared state, reconnection and the
+            // published state are the caller's, and another connect() may have peered meanwhile.
             Logger.websocket
                 .error(
                     "WEBSOCKET: Failed to peer with \(url.absoluteString, privacy: .public): \(error.localizedDescription, privacy: .public)"
                 )
             webSocketTask.cancel()
-            self.webSocketTask = nil
-            peered = false
             throw error
         }
 
@@ -439,7 +448,9 @@ public final class WebSocketProvider: NetworkProvider {
                 }
 
                 _statePublisher.send(.reconnecting)
-                let waitBeforeReconnect = Backoff.delay(reconnectAttempts, withJitter: true)
+                let waitBeforeReconnect = min(
+                    Backoff.delay(reconnectAttempts, withJitter: true), Self.maximumReconnectDelaySeconds
+                )
                 if config.logLevel.canTrace() {
                     Logger.websocket
                         .trace(
@@ -450,11 +461,11 @@ public final class WebSocketProvider: NetworkProvider {
 
                 do {
                     try await Self.waitToReconnect(seconds: waitBeforeReconnect)
+                    let request = try await endpoint?()
+                    // both waits suspended this actor: connect() may have superseded this loop or peered
                     try Task.checkCancellation()
-
-                    // the wait suspended this actor, so connect() may have peered meanwhile
-                    if !peered {
-                        _ = try await attemptConnect(to: try await endpoint?())
+                    if !peered, let request {
+                        _ = try await attemptConnect(to: request)
                     }
                     if peered {
                         peeredAt = .now

@@ -19,13 +19,4 @@ final class WebSocketProviderReconnectTests: XCTestCase {
         }
         XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(900))
     }
-
-    func testRetryInitialConnectRequiresReconnectOnError() {
-        XCTAssertFalse(
-            WebSocketProviderConfiguration(reconnectOnError: false, retryInitialConnect: true).retryInitialConnect
-        )
-        XCTAssertTrue(
-            WebSocketProviderConfiguration(reconnectOnError: true, retryInitialConnect: true).retryInitialConnect
-        )
-    }
 }
