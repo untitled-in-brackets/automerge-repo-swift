@@ -25,16 +25,26 @@ public final class WebSocketProvider: NetworkProvider {
     var ongoingReceiveMessageTask: Task<Void, any Error>?
     var config: WebSocketProviderConfiguration
     // reconnection logic variables
-    var endpoint: URLRequest?
+    /// Builds the request for each connection attempt, so credentials are minted at connect time.
+    var endpoint: (@Sendable () async throws -> URLRequest)?
     var peered: Bool
+
+    /// A connection that held at least this long earns a fresh backoff schedule when it drops.
+    static let stableConnectionDuration: Duration = .seconds(30)
 
     private let _statePublisher: CurrentValueSubject<WebSocketProviderState, Never> =
         CurrentValueSubject(.disconnected)
 
+    /// The current state of the WebSocket connection.
+    public var state: WebSocketProviderState {
+        _statePublisher.value
+    }
+
     /// A publisher that provides state updates for the WebSocket connection.
     ///
     /// The initial value provides the current state of the connecting in the WebSocket provider,
-    /// with updates published when the state changes.
+    /// with updates published when the state changes. ``WebSocketProviderState/reconnecting`` means the
+    /// provider is between attempts; ``WebSocketProviderState/disconnected`` means it has stopped.
     public lazy var statePublisher: AnyPublisher<WebSocketProviderState, Never> = _statePublisher
         .removeDuplicates().eraseToAnyPublisher()
 
@@ -60,8 +70,22 @@ public final class WebSocketProvider: NetworkProvider {
 
     /// Initiate an outgoing connection to a URL Request.
     ///
-    /// Create a WebSocket connection with the `URLRequest` you provide.
+    /// Create a WebSocket connection with the `URLRequest` you provide. Reconnections reuse the same
+    /// request; pass a request builder instead when it carries credentials that expire.
     public func connect(to request: URLRequest) async throws {
+        try await connect { request }
+    }
+
+    /// Initiate an outgoing connection, building the request freshly for every attempt.
+    ///
+    /// `makeRequest` runs before the initial connection and before each reconnection, so an
+    /// `Authorization` header it sets is never replayed after it expires. An error it throws counts as a
+    /// failed attempt.
+    ///
+    /// Throws when the first attempt fails, unless the configuration has `retryInitialConnect` and the
+    /// failure is one a retry could fix: the provider then keeps trying in the background and reports
+    /// ``WebSocketProviderState/reconnecting``.
+    public func connect(to makeRequest: @escaping @Sendable () async throws -> URLRequest) async throws {
         if peered {
             Logger.websocket.error("Attempting to connect while already peered")
             throw Errors.NetworkProviderError(msg: "Attempting to connect while already peered")
@@ -72,40 +96,60 @@ public final class WebSocketProvider: NetworkProvider {
             throw Errors.NetworkProviderError(msg: "Attempting to connect before connected to a delegate")
         }
 
-        if try await attemptConnect(to: request) {
+        endpoint = makeRequest
+        do {
+            let request = try await makeRequest()
+            guard try await attemptConnect(to: request) else {
+                if config.logLevel.canTrace(), let url = request.url {
+                    Logger.websocket.trace("WEBSOCKET: failed to connect to \(url)")
+                }
+                return
+            }
             if config.logLevel.canTrace(), let url = request.url {
                 Logger.websocket.trace("WEBSOCKET: connected to \(url)")
             }
-            endpoint = request
-        } else {
-            if config.logLevel.canTrace(), let url = request.url {
-                Logger.websocket.trace("WEBSOCKET: failed to connect to \(url)")
+        } catch {
+            guard config.retryInitialConnect, Self.isRetryable(error), !Task.isCancelled else {
+                endpoint = nil
+                _statePublisher.send(.disconnected)
+                throw error
             }
+            Logger.websocket.warning(
+                "WEBSOCKET: initial connection failed, retrying in the background: \(error.localizedDescription, privacy: .public)"
+            )
+            _statePublisher.send(.reconnecting)
+            startReceiveLoop(reconnectAttempts: 1)
             return
         }
 
         assert(peered == true)
-
-        // If we have an existing task there, looping over messages, it means there was
-        // one previously set up, and there was a connection failure - at which point
-        // a reconnect was created to re-establish the webSocketTask.
-        if ongoingReceiveMessageTask == nil {
-            // infinitely loop and receive messages, but "out of band"
-            ongoingReceiveMessageTask = Task.detached {
-                await self.ongoingReceiveWebSocketMessages()
-                if await self.config.logLevel.canTrace() {
-                    Logger.websocket.trace("Terminated background read loop - socket expected to be disconnected")
-                }
-            }
-        }
+        startReceiveLoop(reconnectAttempts: 0)
     }
 
     /// Disconnect and terminate any existing connection.
     public func disconnect() async {
+        ongoingReceiveMessageTask?.cancel()
+        await tearDown()
+    }
+
+    /// Reads messages and reconnects "out of band". A loop left over from a dropped connection keeps
+    /// reading from whatever socket `connect` peers next, so at most one runs.
+    private func startReceiveLoop(reconnectAttempts: UInt) {
+        guard ongoingReceiveMessageTask == nil else { return }
+        ongoingReceiveMessageTask = Task.detached {
+            await self.ongoingReceiveWebSocketMessages(reconnectAttempts: reconnectAttempts)
+            if await self.config.logLevel.canTrace() {
+                Logger.websocket.trace("Terminated background read loop - socket expected to be disconnected")
+            }
+        }
+    }
+
+    /// Resets the provider and tells the delegate the peer is gone. Shared by `disconnect()` and the
+    /// receive loop when it stops on its own.
+    private func tearDown() async {
         peered = false
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
         webSocketTask = nil
-        ongoingReceiveMessageTask?.cancel()
         ongoingReceiveMessageTask = nil
         endpoint = nil
         _statePublisher.send(.disconnected)
@@ -116,6 +160,11 @@ public final class WebSocketProvider: NetworkProvider {
         }
 
         await delegate?.receiveEvent(event: .close)
+    }
+
+    /// Whether a later attempt could succeed. Only an HTTP rejection of the upgrade can say no.
+    private static func isRetryable(_ error: any Error) -> Bool {
+        (error as? Errors.ConnectionRejected)?.isRetryable ?? true
     }
 
     /// Requests the network transport to send a message.
@@ -241,7 +290,17 @@ public final class WebSocketProvider: NetworkProvider {
         // protocol message to start the handshake phase of the protocol
         let joinMessage = SyncV1Msg.JoinMsg(senderId: peerId, metadata: peerMetadata)
         let data = try SyncV1Msg.encode(joinMessage)
-        try await webSocketTask.send(.data(data))
+        do {
+            try await webSocketTask.send(.data(data))
+        } catch {
+            webSocketTask.cancel()
+            // a refused upgrade fails the first send; the task still holds the HTTP response
+            if let status = (webSocketTask.response as? HTTPURLResponse)?.statusCode {
+                Logger.websocket.error("WEBSOCKET: \(url.absoluteString, privacy: .public) refused the upgrade: HTTP \(status)")
+                throw Errors.ConnectionRejected(statusCode: status)
+            }
+            throw error
+        }
         _statePublisher.send(.connected)
         do {
             // Race a timeout against receiving a Peer message from the other side
@@ -268,9 +327,7 @@ public final class WebSocketProvider: NetworkProvider {
                 peered: peered
             )
             peeredConnections = [peerConnectionDetails]
-            // these need to be set _before_ we send the delegate message that we're
-            // peered, because that process in turn (can trigger/triggers) a sync
-            endpoint = request
+            // set _before_ the delegate hears we're peered, because that (can) trigger a sync
             self.webSocketTask = webSocketTask
 
             await delegate.receiveEvent(event: .ready(payload: peerConnectionDetails))
@@ -279,9 +336,8 @@ public final class WebSocketProvider: NetworkProvider {
                 Logger.websocket.trace("WEBSOCKET: Peered to targetId: \(peerMsg.senderId) \(peerMsg.debugDescription)")
             }
         } catch {
-            // if there's an error, cancel anything lingering to shut down the websocket,
-            // and set all the pieces to nil. Reconnection is decided outside this function, so
-            // we don't want to erase the endpoint or call self.disconnect() to tear everything down.
+            // Reconnection, and the state that goes with it, is decided by the caller: don't touch
+            // the endpoint or publish here.
             Logger.websocket
                 .error(
                     "WEBSOCKET: Failed to peer with \(url.absoluteString, privacy: .public): \(error.localizedDescription, privacy: .public)"
@@ -289,7 +345,6 @@ public final class WebSocketProvider: NetworkProvider {
             webSocketTask.cancel()
             self.webSocketTask = nil
             peered = false
-            _statePublisher.send(.disconnected)
             throw error
         }
 
@@ -352,31 +407,24 @@ public final class WebSocketProvider: NetworkProvider {
     /// received.
     ///
     /// If the provider configuration (``WebSocketProviderConfiguration``) has `reconnectOnError`
-    /// set to `true`, this function attempts to re-establish a WebSocket connection on connection
-    /// failure or read error. If that value is false, the connection terminates on error and the provider
-    /// reports the connection as ``WebSocketProviderState/disconnected``.
+    /// set to `true`, this function re-establishes the WebSocket connection after a connection failure or
+    /// read error, building each request afresh from the endpoint closure and backing off between attempts.
+    /// If that value is false, the loop ends on the first error.
     ///
-    /// If `reconnectOnError`, and `maxNumberOfConnectRetries` has a positive value, a maximum number of retries
-    /// is enforced. After the provided maximum number of retries, the connection is fully reset and left in the
-    /// state ``WebSocketProviderState/disconnected``.
-    private func ongoingReceiveWebSocketMessages() async {
-        // state needed for reconnect logic:
-        // - should we reconnect on a receive() error/failure
-        //   - let config.reconnectOnError: Bool
-        // - where do we reconnect to?
-        //   - var endpoint: URL?
-        // - are we currently "peered" (authenticated), or does that need to be done before we
-        //   cycle into listen and process mode?
-        //   - var peered: Bool
-
+    /// The loop also ends when the server refuses the upgrade with a status a retry cannot fix, or after
+    /// `maxNumberOfConnectRetries` attempts when that is set. Either way the provider is reset and reports
+    /// ``WebSocketProviderState/disconnected``; while it is between attempts it reports
+    /// ``WebSocketProviderState/reconnecting``.
+    ///
+    /// - Parameter reconnectAttempts: Where the backoff schedule starts; non-zero when the initial
+    /// connection already failed once.
+    private func ongoingReceiveWebSocketMessages(reconnectAttempts: UInt) async {
+        var reconnectAttempts = reconnectAttempts
+        let reconnectOnError = config.reconnectOnError
+        var peeredAt: ContinuousClock.Instant? = peered ? .now : nil
         var msgFromWebSocket: URLSessionWebSocketTask.Message?
-        // local logic:
-        // - how many times have we reconnected (to compute backoff/delay between
-        //   reconnect attempts)
-        var reconnectAttempts: UInt = 0
-        var tryToReconnect = config.reconnectOnError
 
-        repeat {
+        while true {
             msgFromWebSocket = nil
 
             // disconnect() already reset state before cancelling; connect() may have re-peered since
@@ -384,13 +432,9 @@ public final class WebSocketProvider: NetworkProvider {
                 break
             }
 
-            // if we're not currently peered, attempt to reconnect
-            // (if we're configured to do so)
-            if !peered, tryToReconnect {
-                if let maxRetries = config.maxNumberOfConnectRetries, maxRetries > 0, maxRetries > reconnectAttempts {
-                    // maxNumber of connection retries is set, positive, and exceeds the
-                    // number of attempts already made...
-                    tryToReconnect = false
+            if !peered, reconnectOnError {
+                if let maxRetries = config.maxNumberOfConnectRetries, maxRetries > 0, reconnectAttempts >= maxRetries {
+                    Logger.websocket.warning("WEBSOCKET: giving up after \(maxRetries) reconnect attempts")
                     break
                 }
 
@@ -405,41 +449,22 @@ public final class WebSocketProvider: NetworkProvider {
                 reconnectAttempts += 1
 
                 do {
-                    // Wait to reconnect. Wait for waitBeforeReconnect and networth path
-                    // transitioning from not satisfied to satisfied. Whichever comes first.
-                    try await withThrowingTaskGroup(of: Void.self) { group in
-
-                        // Wait for timeout
-                        group.addTask {
-                            try await Task.sleep(for: .seconds(waitBeforeReconnect))
-                        }
-
-                        // Wait for network becomming availible
-                        group.addTask {
-                            let monitor = NWPathMonitor()
-                            var last = monitor.currentPath
-                            for await each in monitor.paths() {
-                                if last.status != .satisfied, each.status == .satisfied {
-                                    Logger.websocket
-                                        .info("WEBSOCKET: Network path satisfied while waiting to reconnect")
-                                    return
-                                } else {
-                                    last = each
-                                }
-                            }
-                        }
-
-                        try await group.next()
-                        group.cancelAll()
-                    }
+                    try await Self.waitToReconnect(seconds: waitBeforeReconnect)
                     try Task.checkCancellation()
 
                     // the wait suspended this actor, so connect() may have peered meanwhile
-                    if peered {
-                        reconnectAttempts = 0
-                    } else if try await attemptConnect(to: endpoint) {
-                        reconnectAttempts = 0
+                    if !peered {
+                        _ = try await attemptConnect(to: try await endpoint?())
                     }
+                    if peered {
+                        peeredAt = .now
+                    }
+                } catch let rejection as Errors.ConnectionRejected where !rejection.isRetryable {
+                    if Task.isCancelled {
+                        break
+                    }
+                    Logger.websocket.error("WEBSOCKET: refused with HTTP \(rejection.statusCode); not retrying")
+                    break
                 } catch {
                     if Task.isCancelled {
                         break
@@ -457,9 +482,17 @@ public final class WebSocketProvider: NetworkProvider {
                 }
                 // error scenario with the WebSocket connection
                 Logger.websocket.warning("WEBSOCKET: Error reading websocket: \(error.localizedDescription)")
-                _statePublisher.send(.disconnected)
                 peered = false
                 msgFromWebSocket = nil
+                // a connection that held for a while starts the schedule over; a flapping one keeps climbing
+                if let lastPeeredAt = peeredAt, .now - lastPeeredAt >= Self.stableConnectionDuration {
+                    reconnectAttempts = 0
+                }
+                peeredAt = nil
+                guard reconnectOnError else {
+                    break
+                }
+                _statePublisher.send(.reconnecting)
             }
 
             if let encodedMessage = msgFromWebSocket {
@@ -478,15 +511,37 @@ public final class WebSocketProvider: NetworkProvider {
                         )
                 }
             }
-        } while tryToReconnect
+        }
 
         if !Task.isCancelled {
-            peered = false
-            webSocketTask?.cancel()
-            webSocketTask = nil
-            _statePublisher.send(.disconnected)
+            await tearDown()
         }
         Logger.websocket.warning("WEBSOCKET: receive and reconnect loop terminated")
+    }
+
+    /// Waits `seconds`, or less if the network path becomes satisfied in the meantime.
+    nonisolated static func waitToReconnect(seconds: Int) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+            }
+
+            group.addTask {
+                let monitor = NWPathMonitor()
+                var last: NWPath.Status?
+                for await path in monitor.paths() {
+                    // the first update is the current path, not a transition
+                    if let last, last != .satisfied, path.status == .satisfied {
+                        Logger.websocket.info("WEBSOCKET: Network path satisfied while waiting to reconnect")
+                        return
+                    }
+                    last = path.status
+                }
+            }
+
+            try await group.next()
+            group.cancelAll()
+        }
     }
 
     func handleMessage(msg: SyncV1Msg) async {
