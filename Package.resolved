@@ -5,8 +5,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/untitled-in-brackets/automerge-swift",
       "state" : {
-        "branch" : "untitled/automerge-3",
-        "revision" : "37bbba9652bc6cb84129a08229399390c912bb5a"
+        "branch" : "untitled/author",
+        "revision" : "1c7c7a7bd4fe602b32d364801dd44a7eed045c41"
       }
     },
     {
