@@ -60,6 +60,23 @@ public enum Errors: Sendable {
         }
     }
 
+    /// The server refused the WebSocket upgrade with an HTTP status.
+    public struct ConnectionRejected: Sendable, LocalizedError {
+        public let statusCode: Int
+        public var errorDescription: String? {
+            "The server rejected the connection with HTTP \(statusCode)"
+        }
+
+        /// Whether a later attempt with fresh credentials could succeed.
+        public var isRetryable: Bool {
+            statusCode >= 500 || [408, 425, 429].contains(statusCode)
+        }
+
+        public init(statusCode: Int) {
+            self.statusCode = statusCode
+        }
+    }
+
     /// The connection closed or does not exist.
     public struct ConnectionClosed: Sendable, LocalizedError {
         public var errorDescription: String = "The connection closed or is nil"

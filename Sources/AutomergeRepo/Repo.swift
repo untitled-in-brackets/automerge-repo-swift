@@ -334,6 +334,10 @@ public final class Repo {
         if logLevel(.repo).canTrace() {
             Logger.repo.trace("REPO: \(self.peerId) adding peer \(peer)")
         }
+        // a sync state belongs to one connection: drop the previous one's session, keep the shared heads
+        for handle in handles.values {
+            handle.syncStates[peer]?.reset()
+        }
         for docId in documentIds() {
             await beginSync(docId: docId, to: peer)
         }
@@ -778,7 +782,14 @@ public final class Repo {
             Logger.repo.error("REPO: missing handle for documentId \(id.description) while attempt to mark unavailable")
             return
         }
-        assert(handle.state == .requesting)
+        // Peers may answer unavailable after another peer already delivered the document, or after
+        // the resolver gave up on its own. Only an outstanding request becomes unavailable.
+        guard handle.state == .requesting else {
+            if logLevel(.repo).canTrace() {
+                Logger.repo.trace("REPO: ignoring unavailable for \(id), state: \(String(describing: handle.state))")
+            }
+            return
+        }
         handle.state = .unavailable
         docHandlePublisher.send(handle.snapshot())
     }
