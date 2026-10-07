@@ -2,7 +2,9 @@ public import Automerge
 
 /// The configuration options for a WebSocket network provider.
 public struct WebSocketProviderConfiguration: Sendable {
-    /// A Boolean value that indicates if the provider should attempt to reconnect when it fails with an error.
+    /// A Boolean value that indicates if the provider should keep the connection alive: retrying a failed
+    /// initial connection and reconnecting after a drop, with backoff, until it is disconnected or the
+    /// server refuses it outright.
     public let reconnectOnError: Bool
     /// The maximum number of reconnections allowed before the WebSocket provider disconnects.
     ///
@@ -20,8 +22,8 @@ public struct WebSocketProviderConfiguration: Sendable {
     public static let `default` = WebSocketProviderConfiguration(reconnectOnError: true)
 
     /// Creates a new WebSocket network provider configuration instance.
-    /// - Parameter reconnectOnError: A Boolean value that indicates if the provider should attempt to reconnect
-    /// when it fails with an error.
+    /// - Parameter reconnectOnError: A Boolean value that indicates if the provider should retry a failed
+    /// initial connection and reconnect after a drop.
     /// - Parameter loggingAt: The verbosity of the logs sent to the unified logging system.
     /// - Parameter maxNumberOfConnectRetries: The maximum number of reconnections allowed before the WebSocket provider disconnects. If `nil`, the default, retries continue forever.
     public init(reconnectOnError: Bool, loggingAt: LogVerbosity = .errorOnly, maxNumberOfConnectRetries: Int? = nil) {
