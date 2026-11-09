@@ -670,6 +670,53 @@ public final class Repo {
         return try await resolveDocHandle(id: handle.id)
     }
 
+    /// The document for `id` if this repo already holds it, in memory or in its storage provider.
+    /// - Parameter id: The id of the document to look up.
+    /// - Returns: A handle to the Automerge document, or `nil` when neither memory nor storage has it.
+    ///
+    /// Never asks peers and never changes the state of an id it does not find. Use this to answer
+    /// "is this document on this device?" without the wait that ``find(id:)`` spends on connected
+    /// peers before it gives up.
+    ///
+    /// A document that ``find(id:)`` previously reported unavailable is checked against storage again,
+    /// so one that arrived afterwards by another path becomes available to both methods. Throws
+    /// ``Errors/DocDeleted`` for a document this repo has deleted.
+    public func findLocal(id: DocumentId) async throws -> DocHandle? {
+        if let handle = handles[id] {
+            switch handle.state {
+            case .ready, .deleted:
+                // resolve hands back the in-memory document, or throws DocDeleted
+                return try await resolveDocHandle(id: id)
+            case .idle, .loading, .requesting, .unavailable:
+                break
+            }
+        }
+        guard let doc = try await loadFromStorage(id: id) else {
+            return nil
+        }
+        // loading suspended: another path may have settled the handle in the meantime
+        if let handle = handles[id] {
+            switch handle.state {
+            case .ready, .deleted:
+                return try await resolveDocHandle(id: id)
+            case .idle, .loading, .requesting, .unavailable:
+                // a .requesting handle belongs to an in-flight find, which returns once it sees .ready
+                handle.doc = doc
+                handle.state = .ready
+                handle.remote = false
+                docHandlePublisher.send(handle.snapshot())
+            }
+        } else {
+            let newHandle = InternalDocHandle(id: id, isNew: false, initialValue: doc)
+            handles[id] = newHandle
+            docHandlePublisher.send(newHandle.snapshot())
+        }
+        if logLevel(.resolver).canTrace() {
+            Logger.resolver.trace("RESOLVE: :: loaded \(id) from storage provider for a local lookup")
+        }
+        return try await resolveDocHandle(id: id)
+    }
+
     /// Deletes an automerge document from the repo.
     /// - Parameter id: The id of the document to remove.
     ///

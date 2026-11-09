@@ -41,6 +41,7 @@ When network providers are active, the repository attempts to sync documents wit
 ### Requesting a document
 
 - ``find(id:)``
+- ``findLocal(id:)``
 
 ### Deleting a document
 
