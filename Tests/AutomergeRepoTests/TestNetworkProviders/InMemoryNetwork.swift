@@ -288,7 +288,7 @@ public final class InMemoryNetworkEndpoint: NetworkProvider {
             switch msg {
             case let .leave(msg):
                 span.addEvent(SpanEvent(name: "leave msg received"))
-                await self.delegate?.receiveEvent(event: .close)
+                await self.delegate?.receiveEvent(event: .close, from: self)
                 _connections.removeAll { connection in
                     connection.initiatingEndpoint.peerId == msg.senderId ||
                         connection.receivingEndpoint.peerId == msg.senderId
@@ -309,7 +309,8 @@ public final class InMemoryNetworkEndpoint: NetworkProvider {
                     await self.delegate?.receiveEvent(
                         event: .peerCandidate(
                             payload: peerConnectionDetails
-                        )
+                        ),
+                        from: self
                     )
                     peeredConnections.append(peerConnectionDetails)
                     span.addEvent(SpanEvent(name: "replying with peer msg"))
@@ -340,7 +341,8 @@ public final class InMemoryNetworkEndpoint: NetworkProvider {
                 await self.delegate?.receiveEvent(
                     event: .ready(
                         payload: peerConnectionDetails
-                    )
+                    ),
+                    from: self
                 )
             default:
                 if self.delegate == nil, logReceivedMessages {
@@ -348,7 +350,7 @@ public final class InMemoryNetworkEndpoint: NetworkProvider {
                         .warning("ADAPTER \(self.debugDescription) has no delegate, ignoring received message")
                 }
                 span.addEvent(SpanEvent(name: "forwarding received msg to delegate"))
-                await self.delegate?.receiveEvent(event: .message(payload: msg))
+                await self.delegate?.receiveEvent(event: .message(payload: msg), from: self)
             }
         }
     }

@@ -4,4 +4,5 @@
 
 ### A type that receives and processes network events
 
+- ``NetworkEventReceiver/receiveEvent(event:from:)``
 - ``NetworkEventReceiver/receiveEvent(event:)``

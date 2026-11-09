@@ -15,6 +15,7 @@ For example, when your app uses a shared location in iCloud drive or DropBox.
 
 With a network provider, you can connect to servers or other applications on a peer-to-peer network to share documents and synchronize them as changes are made by any collaborators.
 Automerge Repo supports multiple active providers, allowing you to both synchronize to a server and to collaborators on a local network.
+A message addressed to a peer goes out only through the network provider that reached that peer, matching the JS library; a message with no addressed peer is broadcast through every provider.
 This library provides a WebSocket network provider for connecting to instances of a server app built using [automerge-repo](https://github.com/automerge/automerge-repo).
 This library also provides the types, encoding, and messages to interoperate with the cross-language and cross-platform Automerge sync protocol over any network transport.
 

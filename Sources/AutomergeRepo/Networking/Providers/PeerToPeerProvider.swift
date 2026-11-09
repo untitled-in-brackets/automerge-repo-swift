@@ -398,7 +398,7 @@ public final class PeerToPeerProvider: NetworkProvider {
                 initiated: peerConnection.initiated,
                 peered: peerConnection.peered
             )
-            await delegate.receiveEvent(event: .ready(payload: peerConnectionDetails))
+            await delegate.receiveEvent(event: .ready(payload: peerConnectionDetails), from: self)
             if config.logLevel.canTrace() {
                 Logger.peer2peer.trace("P2PNET: Peered to: \(peerMsg.senderId) \(peerMsg.debugDescription)")
             }
@@ -496,7 +496,7 @@ public final class PeerToPeerProvider: NetworkProvider {
         case let .peer(msg):
             Logger.peer2peer.error("P2PNET: Unexpected message received: \(msg.debugDescription)")
         default:
-            await delegate?.receiveEvent(event: .message(payload: msg))
+            await delegate?.receiveEvent(event: .message(payload: msg), from: self)
         }
     }
 
@@ -757,7 +757,7 @@ public final class PeerToPeerProvider: NetworkProvider {
                     }
                     ongoingReceiveMessageTasks[peerConnection.endpoint] = receiveAndRetry
 
-                    await delegate.receiveEvent(event: .ready(payload: peerConnectionDetails))
+                    await delegate.receiveEvent(event: .ready(payload: peerConnectionDetails), from: self)
                 }
             } catch {
                 // error thrown during peering
@@ -810,7 +810,7 @@ public final class PeerToPeerProvider: NetworkProvider {
             initiated: holder.initiated,
             peered: holder.peered
         )
-        await delegate.receiveEvent(event: .peerCandidate(payload: peerConnectionDetails))
+        await delegate.receiveEvent(event: .peerCandidate(payload: peerConnectionDetails), from: self)
 
         // check to verify the requested protocol version matches what we're expecting
         if joinMsg.supportedProtocolVersions != supportedProtocolVersion {
