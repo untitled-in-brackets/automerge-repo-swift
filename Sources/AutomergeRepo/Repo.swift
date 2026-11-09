@@ -260,6 +260,15 @@ public final class Repo {
         network.addAdapter(adapter: adapter)
     }
 
+    /// Removes a network provider from the repo, disconnecting it and forgetting the peers it reached.
+    /// - Parameter adapter: The network provider to remove.
+    ///
+    /// The peers the provider reached leave ``peers()`` and the repo stops sending to them; events the
+    /// provider reports after removal are ignored. Removing a provider the repo does not have is a no-op.
+    public func removeNetworkAdapter(adapter: any NetworkProvider) async {
+        await network.removeAdapter(adapter: adapter)
+    }
+
     /// Set the delegate that to receive ephemeral messages from Automerge-repo peers
     /// - Parameter delegate: The object that Automerge-repo calls with ephemeral messages.
     public func setDelegate(_ delegate: some EphemeralMessageReceiver) {

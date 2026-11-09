@@ -64,6 +64,36 @@ final class NetworkSubsystem {
         adapters.append(adapter)
     }
 
+    /// Stops routing through `adapter`, disconnects it, and forgets the peers it reached.
+    ///
+    /// The adapter leaves the list first, so nothing it reports while disconnecting is acted on; the peers
+    /// it owned routes for are then removed from the repo directly. Removing an unknown adapter is a no-op.
+    func removeAdapter(adapter: any NetworkProvider) async {
+        guard let index = adapters.firstIndex(where: { Self.isSame($0, adapter) }) else {
+            if loglevel.canTrace() {
+                Logger.network.trace("REPONET: ignoring removal of unknown adapter \(String(describing: adapter))")
+            }
+            return
+        }
+        adapters.remove(at: index)
+        if loglevel.canTrace() {
+            Logger.network.trace("REPONET: removing adapter \(String(describing: adapter))")
+        }
+        await adapter.disconnect()
+        let orphaned = adaptersByPeer.filter { Self.isSame($0.value, adapter) }.map(\.key)
+        for peerId in orphaned {
+            if loglevel.canTrace() {
+                Logger.network.trace("REPONET: dropping route for peer \(peerId), adapter removed")
+            }
+            adaptersByPeer.removeValue(forKey: peerId)
+            repo?.removePeer(peer: peerId)
+        }
+    }
+
+    private func isKnown(_ adapter: any NetworkProvider) -> Bool {
+        adapters.contains { Self.isSame($0, adapter) }
+    }
+
     func startRemoteFetch(id: DocumentId) async throws {
         // attempt to fetch the provided document Id from all (current) peers, returning the document
         // or returning nil if the document is unavailable.
@@ -195,10 +225,18 @@ extension NetworkSubsystem: NetworkEventReceiver {
     }
 
     /// Handles an event from an adapter. Without the adapter, the routing table isn't updated, so messages
-    /// addressed to peers the anonymous adapter reports are dropped by ``send(message:to:)``.
+    /// addressed to peers the anonymous adapter reports are dropped by ``send(message:to:)``. Events from an
+    /// adapter that has been removed are ignored.
     private func handle(event: NetworkAdapterEvents, from adapter: (any NetworkProvider)?) async {
         if loglevel.canTrace() {
             Logger.network.trace("REPONET: received event from network adapter: \(event.debugDescription)")
+        }
+        if let adapter, !isKnown(adapter) {
+            if loglevel.canTrace() {
+                Logger.network
+                    .trace("REPONET: ignoring \(event.debugDescription) from removed adapter \(String(describing: adapter))")
+            }
+            return
         }
         guard let repo else {
             // No-op if there's no repo to update state or handle

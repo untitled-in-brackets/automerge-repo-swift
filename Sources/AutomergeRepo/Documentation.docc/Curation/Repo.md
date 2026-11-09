@@ -6,7 +6,7 @@ Initialize a repository with a storage provider to enable automatic loading and 
 Add one or more network adapters to support synchronization of updates between any connected peers.
 Documents are shared on request, or not, based on ``SharePolicy`` you provide when creating the repository.
 
-Enable network providers with async calls to ``addNetworkAdapter(adapter:)``.
+Enable network providers with async calls to ``addNetworkAdapter(adapter:)``, and retire one with ``removeNetworkAdapter(adapter:)``.
 When network providers are active, the repository attempts to sync documents with connected peers on any update to the an Automerge document.
 
 ## Topics
@@ -21,6 +21,7 @@ When network providers are active, the repository attempts to sync documents wit
 ### Configuring a repository
 
 - ``addNetworkAdapter(adapter:)``
+- ``removeNetworkAdapter(adapter:)``
 - ``setDelegate(_:)``
 - ``setLogLevel(_:to:)``
 - ``LogComponent``

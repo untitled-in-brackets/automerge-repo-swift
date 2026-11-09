@@ -13,13 +13,26 @@ final class RecordingNetworkProvider: NetworkProvider {
     var peeredConnections: [PeerConnectionInfo] = []
     var delegate: (any NetworkEventReceiver)?
     var sent: [(message: SyncV1Msg, to: PEER_ID?)] = []
+    var disconnectCount = 0
+    private var reportsOnDisconnect = true
 
     nonisolated init(name: String) {
         self.name = name
     }
 
     func connect(to _: String) async throws {}
-    func disconnect() async {}
+
+    /// Reports its peers gone and closes, the way `WebSocketProvider.tearDown` does.
+    func disconnect() async {
+        disconnectCount += 1
+        let peers = peeredConnections
+        peeredConnections = []
+        guard reportsOnDisconnect else { return }
+        for peer in peers {
+            await delegate?.receiveEvent(event: .peerDisconnect(payload: .init(peerId: peer.peerId)), from: self)
+        }
+        await delegate?.receiveEvent(event: .close, from: self)
+    }
 
     func send(message: SyncV1Msg, to: PEER_ID?) async {
         sent.append((message, to))
@@ -68,6 +81,11 @@ final class RecordingNetworkProvider: NetworkProvider {
 
     func clearSent() {
         sent = []
+    }
+
+    /// Makes `disconnect` tell the delegate nothing, like `PeerToPeerProvider`.
+    func silenceDisconnect() {
+        reportsOnDisconnect = false
     }
 }
 
@@ -232,6 +250,57 @@ final class NetworkRoutingTests: XCTestCase {
         two = await adapterTwo.sent
         XCTAssertTrue(one.isEmpty)
         XCTAssertEqual(two.count, 1, "the stale connection's disconnect must not drop the replacement's route")
+    }
+
+    func testRemoveNetworkAdapterDisconnectsItAndForgetsItsPeers() async throws {
+        await repo.removeNetworkAdapter(adapter: adapterOne)
+        let disconnects = await adapterOne.disconnectCount
+        XCTAssertEqual(disconnects, 1)
+        let peers = await repo.peers()
+        XCTAssertEqual(peers, [peerTwo])
+
+        await repo.send(ephemeral(to: peerOne), to: peerOne)
+        await repo.send(ephemeral(to: peerTwo), to: peerTwo)
+        await repo.send(ephemeral(to: repo.peerId), to: nil)
+        let one = await adapterOne.sent
+        let two = await adapterTwo.sent
+        XCTAssertTrue(one.isEmpty, "a removed adapter gets neither routed nor broadcast messages")
+        XCTAssertEqual(two.count, 2, "the other adapter keeps its route and still hears broadcasts")
+    }
+
+    func testRemoveNetworkAdapterCleansUpWhenTheAdapterReportsNothing() async throws {
+        // PeerToPeerProvider never emits peerDisconnect/close; removal must not depend on it
+        let quiet = RecordingNetworkProvider(name: "quiet")
+        await repo.addNetworkAdapter(adapter: quiet)
+        await quiet.peer(with: "quiet-peer")
+        await quiet.silenceDisconnect()
+
+        await repo.removeNetworkAdapter(adapter: quiet)
+        let peers = await repo.peers()
+        XCTAssertEqual(peers, [peerOne, peerTwo])
+        await repo.send(ephemeral(to: "quiet-peer"), to: "quiet-peer")
+        let sent = await quiet.sent
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    func testEventsFromARemovedAdapterAreIgnored() async throws {
+        await repo.removeNetworkAdapter(adapter: adapterOne)
+        // a connect attempt that was in flight when the adapter was removed finally peers
+        await adapterOne.peer(with: peerOne)
+        let peers = await repo.peers()
+        XCTAssertEqual(peers, [peerTwo])
+        await repo.send(ephemeral(to: peerOne), to: peerOne)
+        let one = await adapterOne.sent
+        XCTAssertTrue(one.isEmpty)
+    }
+
+    func testRemovingAnUnknownAdapterIsANoOp() async throws {
+        let stranger = RecordingNetworkProvider(name: "stranger")
+        await repo.removeNetworkAdapter(adapter: stranger)
+        let disconnects = await stranger.disconnectCount
+        XCTAssertEqual(disconnects, 0)
+        let peers = await repo.peers()
+        XCTAssertEqual(peers, [peerOne, peerTwo])
     }
 
     func testPeerReportedWithoutAnAdapterHasNoRoute() async throws {
