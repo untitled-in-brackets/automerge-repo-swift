@@ -57,6 +57,11 @@ When network providers are active, the repository attempts to sync documents wit
 - ``documentIds()``
 - ``peers()``
 
+### Following changes applied from peers and merges
+
+- ``documentChangePublisher``
+- ``documentChanges(for:)``
+
 ### Requesting ongoing updates from peers
 
 - ``subscribeToRemotes(remotes:)``

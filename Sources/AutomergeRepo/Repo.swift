@@ -1,6 +1,6 @@
 public import Automerge
 internal import AutomergeUtilities
-@preconcurrency internal import Combine
+@preconcurrency public import Combine
 public import Foundation
 internal import OSLog
 
@@ -64,6 +64,36 @@ public final class Repo {
     /// On a received request, the peer in the `SyncRequest` is the peer from which we received the message.
     nonisolated let syncRequestPublisher: PassthroughSubject<SyncRequest, Never> =
         PassthroughSubject()
+
+    /// Changes the repo applies to documents from peers and merges, in the order they are applied.
+    ///
+    /// Writes made directly to a handle's document are not published; the caller made those. Values are
+    /// sent from the repo's actor, after the document and its handle have been updated; hop to your own
+    /// isolation before touching your state. See ``documentChanges(for:)`` for a per-document stream.
+    public nonisolated let documentChangePublisher: PassthroughSubject<DocumentChange, Never> =
+        PassthroughSubject()
+
+    /// ``documentChangePublisher`` filtered to `id`, as a stream.
+    /// - Parameter id: The document to follow.
+    /// - Returns: A stream that yields each change the repo applies to `id` from a peer or a merge, and
+    /// finishes when the repo deallocates.
+    public nonisolated func documentChanges(for id: DocumentId) -> AsyncStream<DocumentChange> {
+        AsyncStream { continuation in
+            let subscription = documentChangePublisher
+                .filter { $0.id == id }
+                .sink(
+                    receiveCompletion: { _ in continuation.finish() },
+                    receiveValue: { continuation.yield($0) }
+                )
+            continuation.onTermination = { _ in subscription.cancel() }
+        }
+    }
+
+    /// Publishes a change the repo applied, when it produced any patches.
+    private func publishChange(id: DocumentId, patches: [Patch], doc: Document, source: DocumentChange.Source) {
+        guard !patches.isEmpty else { return }
+        documentChangePublisher.send(DocumentChange(id: id, patches: patches, heads: doc.heads(), source: source))
+    }
 
     // REPO
     // https://github.com/automerge/automerge-repo/blob/main/packages/automerge-repo/src/Repo.ts
@@ -441,10 +471,12 @@ public final class Repo {
             let docFromHandle = handle.doc ?? Document(logLevel: documentLogVerbosity)
             let syncState = syncState(id: docId, peer: msg.senderId)
             // Apply the request message as a sync update
-            try docFromHandle.receiveSyncMessage(state: syncState, message: msg.data)
+            let patches = try docFromHandle.receiveSyncMessageWithPatches(state: syncState, message: msg.data)
             // Stash the updated document and sync state
             await updateDoc(id: docId, doc: docFromHandle)
             await updateSyncState(id: docId, peer: msg.senderId, syncState: syncState)
+            // the handle is .ready and the save queued, so a consumer can find the document during the event
+            publishChange(id: docId, patches: patches, doc: docFromHandle, source: .sync(peer: msg.senderId))
             // Attempt to generate a sync message to reply
 
             // DEBUG ONLY
@@ -492,10 +524,11 @@ public final class Repo {
                     let handle = try await resolveDocHandle(id: docId)
                     let syncState = syncState(id: docId, peer: msg.senderId)
                     // Apply the request message as a sync update
-                    try handle.doc.receiveSyncMessage(state: syncState, message: msg.data)
+                    let patches = try handle.doc.receiveSyncMessageWithPatches(state: syncState, message: msg.data)
                     // Stash the updated doc and sync state
                     await updateDoc(id: docId, doc: handle.doc)
                     await updateSyncState(id: docId, peer: msg.senderId, syncState: syncState)
+                    publishChange(id: docId, patches: patches, doc: handle.doc, source: .sync(peer: msg.senderId))
                     // Attempt to generate a sync message to reply
                     if let syncData = handle.doc.generateSyncMessage(state: syncState) {
                         let syncMsg: SyncV1Msg = .sync(.init(
@@ -603,8 +636,9 @@ public final class Repo {
             }
             // verify that the document exists on the handle, and if so, merge
             // and save it
+            var mergePatches: [Patch] = []
             if let existingDoc = existingHandle.doc {
-                try existingDoc.merge(other: handle.doc)
+                mergePatches = try existingDoc.mergeWithPatches(other: handle.doc)
                 // store the document if there's a storage provider available
                 try await storage?.saveDoc(id: existingHandle.id, doc: existingDoc)
             } else {
@@ -616,6 +650,9 @@ public final class Repo {
             }
             existingHandle.state = .ready
             docHandlePublisher.send(existingHandle.snapshot())
+            if let mergedDoc = existingHandle.doc {
+                publishChange(id: existingHandle.id, patches: mergePatches, doc: mergedDoc, source: .merge)
+            }
             // calling resolveDocHandle when we've just set the state to .ready
             // is tantamount to asking for a DocHandle from the internal variation
             // but with some extra checks to make sure nothing is awry with expected state.
@@ -888,21 +925,23 @@ public final class Repo {
         }
 
         let doc1 = try await resolveDocHandle(id: handle1.id)
+        var patches: [Patch] = []
         // Start with updating from storage changes, if any
         if let doc1Storage = try await storage?.loadDoc(id: handle1.id) {
-            try doc1.doc.merge(other: doc1Storage)
+            patches += try doc1.doc.mergeWithPatches(other: doc1Storage)
         }
 
         // merge in the provided second document from memory
         let doc2 = try await resolveDocHandle(id: handle2.id)
-        try doc1.doc.merge(other: doc2.doc)
+        patches += try doc1.doc.mergeWithPatches(other: doc2.doc)
 
         // JUST IN CASE, try and load doc2 from storage and merge that if available
         if let doc2Storage = try await storage?.loadDoc(id: handle2.id) {
-            try doc1.doc.merge(other: doc2Storage)
+            patches += try doc1.doc.mergeWithPatches(other: doc2Storage)
         }
         // finally, update the repo
         await updateDoc(id: doc1.id, doc: doc1.doc)
+        publishChange(id: doc1.id, patches: patches, doc: doc1.doc, source: .merge)
     }
 
     private func loadFromStorage(id: DocumentId) async throws -> Document? {
