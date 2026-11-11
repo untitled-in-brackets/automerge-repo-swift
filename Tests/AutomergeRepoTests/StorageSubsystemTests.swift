@@ -159,6 +159,164 @@ final class StorageSubsystemTests: XCTestCase {
         XCTAssertNotNil(reloaded, "a document saved after a purge of the same id must reach storage")
     }
 
+    /// Saves `doc` until it has a base snapshot and no chunks, so the next save is incremental.
+    /// (With no base, any in-memory chunk makes the next save a compaction instead.)
+    private func saveToBaseSnapshot(
+        _ doc: Document, id: DocumentId, in subsystem: DocumentStorage, provider: ControllableStorage
+    ) async throws {
+        try await subsystem.saveDoc(id: id, doc: doc) // incremental, chunk only
+        try doc.put(obj: .ROOT, key: "settle", value: .String("1"))
+        doc.commitWith()
+        try await subsystem.saveDoc(id: id, doc: doc) // compacts: chunk > absent base
+        let base = try await provider.load(id: id)
+        let chunks = try await provider.loadRange(id: id, prefix: subsystem.chunkNamespace)
+        XCTAssertNotNil(base, "precondition: a base snapshot exists")
+        XCTAssertTrue(chunks.isEmpty, "precondition: no chunks remain")
+    }
+
+    func testASaveInFlightWhenThePurgeRunsLeavesNothingBehind() async throws {
+        let provider = ControllableStorage()
+        let subsystem = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let id = DocumentId()
+        let doc = try RepoHelpers.documentWithData()
+        try await saveToBaseSnapshot(doc, id: id, in: subsystem, provider: provider)
+        try doc.put(obj: .ROOT, key: "late", value: .String("edit"))
+        doc.commitWith()
+
+        // this save is incremental; its chunk write is slow and the purge runs while it is in flight
+        await provider.queueWriteDelays([.milliseconds(300)])
+        let straddlingSave = Task { try await subsystem.saveDoc(id: id, doc: doc) }
+        try await Task.sleep(for: .milliseconds(50))
+        try await subsystem.purgeDoc(id: id)
+        try await straddlingSave.value
+
+        let chunks = try await provider.loadRange(id: id, prefix: subsystem.chunkNamespace)
+        XCTAssertTrue(chunks.isEmpty, "the straddling save must take its chunk back out")
+        let base = try await provider.load(id: id)
+        XCTAssertNil(base)
+        let heads = await subsystem.latestHeads[id]
+        XCTAssertNil(heads, "no heads may be recorded for a purged document")
+        let fresh = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let reloaded = try await fresh.loadDoc(id: id)
+        XCTAssertNil(reloaded)
+    }
+
+    func testACompactionInFlightWhenThePurgeRunsLeavesNothingBehind() async throws {
+        let provider = ControllableStorage()
+        let subsystem = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let id = DocumentId()
+        let doc = Document()
+        try doc.put(obj: .ROOT, key: "a", value: .String("1"))
+        doc.commitWith()
+        try await subsystem.saveDoc(id: id, doc: doc)
+        // large enough that the next save compacts; its snapshot write is slow
+        try doc.put(obj: .ROOT, key: "b", value: .String(String(repeating: "x", count: 2000)))
+        doc.commitWith()
+        await provider.queueWriteDelays([.milliseconds(300)])
+        let straddlingCompaction = Task { try await subsystem.saveDoc(id: id, doc: doc) }
+        try await Task.sleep(for: .milliseconds(50))
+        try await subsystem.purgeDoc(id: id)
+        try await straddlingCompaction.value
+
+        let base = try await provider.load(id: id)
+        XCTAssertNil(base, "the straddling compaction must take its snapshot back out")
+        let chunks = try await provider.loadRange(id: id, prefix: subsystem.chunkNamespace)
+        XCTAssertTrue(chunks.isEmpty)
+        let heads = await subsystem.latestHeads[id]
+        XCTAssertNil(heads)
+    }
+
+    func testADocumentSavedUnderAPurgedIdAfterAStraddlingSaveReachesStorage() async throws {
+        let provider = ControllableStorage()
+        let subsystem = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let id = DocumentId()
+        let doc = try RepoHelpers.documentWithData()
+        try await saveToBaseSnapshot(doc, id: id, in: subsystem, provider: provider)
+        try doc.put(obj: .ROOT, key: "late", value: .String("edit"))
+        doc.commitWith()
+        await provider.queueWriteDelays([.milliseconds(300)])
+        let straddlingSave = Task { try await subsystem.saveDoc(id: id, doc: doc) }
+        try await Task.sleep(for: .milliseconds(50))
+        try await subsystem.purgeDoc(id: id)
+        try await straddlingSave.value
+
+        // The same document comes back under the same id, as a restore from a peer would. Its heads
+        // equal what the straddling save would have recorded, so stale heads would skip this save and
+        // leave only the straddling chunk on disk, which cannot load without the purged base.
+        let restored = try Document(doc.save())
+        try await subsystem.saveDoc(id: id, doc: restored)
+        let fresh = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let reloaded = try await fresh.loadDoc(id: id)
+        XCTAssertEqual(try XCTUnwrap(reloaded).heads(), restored.heads())
+    }
+
+    func testASaveInFlightWhenACompactionRunsKeepsItsChunkAndTheCompactedHeads() async throws {
+        let provider = ControllableStorage()
+        let subsystem = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let id = DocumentId()
+        let doc = try RepoHelpers.documentWithData()
+        try await saveToBaseSnapshot(doc, id: id, in: subsystem, provider: provider)
+
+        // an incremental save whose chunk write is slow...
+        try doc.put(obj: .ROOT, key: "small", value: .String("edit"))
+        doc.commitWith()
+        await provider.queueWriteDelays([.milliseconds(300)])
+        let straddlingSave = Task { try await subsystem.saveDoc(id: id, doc: doc) }
+        try await Task.sleep(for: .milliseconds(50))
+        // ...while a compaction of a larger document runs to completion
+        try doc.put(obj: .ROOT, key: "big", value: .String(String(repeating: "x", count: 4000)))
+        doc.commitWith()
+        try await subsystem.compact(id: id, doc: doc)
+        let compactedHeads = doc.heads()
+        try await straddlingSave.value
+
+        // the chunk is redundant (the snapshot holds its changes) but stays: were the snapshot's write to
+        // fail, it would be those changes' only copy on disk. The next compaction folds it in.
+        let chunks = try await provider.loadRange(id: id, prefix: subsystem.chunkNamespace)
+        XCTAssertEqual(chunks.count, 1, "the straddling chunk stays on disk")
+        let heads = await subsystem.latestHeads[id]
+        XCTAssertEqual(heads, compactedHeads, "the straddling save must not set the saved heads back")
+        let fresh = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let reloaded = try await fresh.loadDoc(id: id)
+        XCTAssertEqual(try XCTUnwrap(reloaded).heads(), compactedHeads, "snapshot plus redundant chunk loads clean")
+    }
+
+    func testASaveStraddlingACompactionWhoseWriteFailsKeepsTheChangesOnDisk() async throws {
+        let provider = ControllableStorage()
+        let subsystem = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let id = DocumentId()
+        let doc = try RepoHelpers.documentWithData()
+        try await saveToBaseSnapshot(doc, id: id, in: subsystem, provider: provider)
+
+        // the incremental save's write is slow; the compaction's snapshot write, which starts later,
+        // is slower still and then fails
+        try doc.put(obj: .ROOT, key: "small", value: .String("edit"))
+        doc.commitWith()
+        await provider.queueWriteDelays([.milliseconds(200), .milliseconds(400)])
+        let straddlingSave = Task { try await subsystem.saveDoc(id: id, doc: doc) }
+        try await Task.sleep(for: .milliseconds(50)) // the save's write has started and will succeed
+        try doc.put(obj: .ROOT, key: "big", value: .String(String(repeating: "x", count: 4000)))
+        doc.commitWith()
+        await provider.setWritesFail(true) // the compaction's write starts after this and will fail
+        let compaction = Task { try await subsystem.compact(id: id, doc: doc) }
+        try await straddlingSave.value
+        do {
+            try await compaction.value
+            XCTFail("expected the snapshot write to fail")
+        } catch is ControllableStorage.WriteFailed {}
+        await provider.setWritesFail(false)
+
+        // the small edit is on disk in the straddling chunk; a fresh load has it
+        let fresh = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let reloaded = try await fresh.loadDoc(id: id)
+        XCTAssertEqual(try XCTUnwrap(reloaded).get(obj: .ROOT, key: "small"), .Scalar(.String("edit")))
+        // and the next save still writes the big edit, which never reached disk
+        try await subsystem.saveDoc(id: id, doc: doc)
+        let afterRetry = try await DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+            .loadDoc(id: id)
+        XCTAssertEqual(try XCTUnwrap(afterRetry).heads(), doc.heads())
+    }
+
     func testCompactionResumesAfterAFailedCompaction() async throws {
         let provider = ControllableStorage()
         let subsystem = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)

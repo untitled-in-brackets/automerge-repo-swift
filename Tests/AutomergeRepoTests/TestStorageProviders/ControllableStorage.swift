@@ -29,13 +29,15 @@ public final class ControllableStorage: StorageProvider {
 
     private func beforeWrite() async throws {
         writeCount += 1
+        // decided when the write starts, so a flag flipped during a slow write affects only later writes
+        let fails = failWrites
         if !writeDelays.isEmpty {
             let delay = writeDelays.removeFirst()
             if delay > .zero {
                 try await Task.sleep(for: delay)
             }
         }
-        if failWrites {
+        if fails {
             throw WriteFailed()
         }
     }
