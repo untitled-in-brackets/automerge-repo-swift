@@ -206,23 +206,30 @@ final class TwoReposWithInMemoryNetworkTests: XCTestCase {
 
         await repo_nonsharing.setLogLevel(.resolver, to: .tracing)
         await repo_nonsharing.setLogLevel(.network, to: .tracing)
-        // We can _request_ the document, and should find it - but it won't YET be updated...
+        // We can _request_ the document, and should find it. Over the in-memory network the request,
+        // the sync reply and its application all complete inside `find`, so the document is already
+        // equivalent when it returns.
         let foundDoc = try await repo_nonsharing.find(id: newDocId)
+        XCTAssertEqual(foundDoc.doc.getHistory(), newDoc.doc.getHistory())
+        XCTAssertFalse(foundDoc.doc === newDoc.doc, "the two repos hold separate documents")
 
-        // set up expectation to await for trigger from the objectWillChange publisher on the "found" doc
-        let documentsEquivalent = expectation(
-            description: "The document should eventually become equivalent"
-        )
-
+        // The found document must then follow later changes from the peer, in place. Subscribe before
+        // the change so the test cannot miss the notification.
+        let followsPeer = expectation(description: "The found document should follow the peer's later change")
         var fulfilledOnce = false
         let a = foundDoc.doc.objectWillChange.receive(on: DispatchQueue.main).sink { _ in
             if !fulfilledOnce, foundDoc.doc.getHistory() == newDoc.doc.getHistory() {
-                documentsEquivalent.fulfill()
                 fulfilledOnce = true
+                followsPeer.fulfill()
             }
         }
         XCTAssertNotNil(a)
-        await fulfillment(of: [documentsEquivalent], timeout: 10, enforceOrder: false)
+        try newDoc.doc.put(obj: .ROOT, key: "title", value: .String("UPDATED VALUE"))
+        newDoc.doc.commitWith()
+        XCTAssertNotEqual(foundDoc.doc.getHistory(), newDoc.doc.getHistory(), "the change has not reached One yet")
+
+        await fulfillment(of: [followsPeer], timeout: 10)
+        XCTAssertEqual(try foundDoc.doc.get(obj: .ROOT, key: "title"), .Scalar(.String("UPDATED VALUE")))
     }
 
     func testFind_nonsharing() async throws {
