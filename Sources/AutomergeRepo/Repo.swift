@@ -865,7 +865,12 @@ public final class Repo {
                 Logger.repo.trace("REPO: No stored sync state for doc \(id) and peer \(peer).")
                 Logger.repo.trace("REPO: Creating a new sync state for doc \(id)")
             }
-            return SyncState()
+            // Store it before handing it out: there is one sync state per (document, peer) from first
+            // use, as the JS and Rust ports keep it on the peer connection. Callers that only generate a
+            // message, like beginSync, otherwise worked from a throwaway state the reply never matched.
+            let fresh = SyncState()
+            handle.syncStates[peer] = fresh
+            return fresh
         }
     }
 
