@@ -123,6 +123,116 @@ final class StorageSubsystemTests: XCTestCase {
         XCTAssertEqual(loaded.heads(), doc.heads())
     }
 
+    func testPurgeRemovesAChunkOnlyDocument() async throws {
+        let newDoc = try RepoHelpers.documentWithData()
+        let newDocId = DocumentId()
+        try await subsystem.saveDoc(id: newDocId, doc: newDoc)
+        // the first save writes only an incremental chunk, no base snapshot
+        let base = await testStorageProvider.load(id: newDocId)
+        let chunks = await testStorageProvider.loadRange(id: newDocId, prefix: subsystem.chunkNamespace)
+        XCTAssertNil(base)
+        XCTAssertEqual(chunks.count, 1)
+
+        try await subsystem.purgeDoc(id: newDocId)
+
+        let chunksAfter = await testStorageProvider.loadRange(id: newDocId, prefix: subsystem.chunkNamespace)
+        XCTAssertTrue(chunksAfter.isEmpty, "purge must remove incremental chunks, not just the base snapshot")
+        let reloaded = try await subsystem.loadDoc(id: newDocId)
+        XCTAssertNil(reloaded, "nothing should load back after a purge")
+        // a fresh subsystem over the same provider agrees: the document is gone from disk
+        let fresh = DocumentStorage(testStorageProvider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let reloadedFresh = try await fresh.loadDoc(id: newDocId)
+        XCTAssertNil(reloadedFresh)
+    }
+
+    func testPurgeForgetsHeadsSoTheSameIdCanBeSavedAgain() async throws {
+        let id = DocumentId()
+        let first = try RepoHelpers.documentWithData()
+        try await subsystem.saveDoc(id: id, doc: first)
+        try await subsystem.purgeDoc(id: id)
+
+        // a new document under the same id, with the same heads as the purged one: it must still be
+        // written, which it would not be if the purged heads were still recorded as saved
+        let again = try Document(first.save())
+        try await subsystem.saveDoc(id: id, doc: again)
+        let reloaded = try await subsystem.loadDoc(id: id)
+        XCTAssertNotNil(reloaded, "a document saved after a purge of the same id must reach storage")
+    }
+
+    func testCompactionResumesAfterAFailedCompaction() async throws {
+        let provider = ControllableStorage()
+        let subsystem = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let id = DocumentId()
+        let doc = Document()
+        try doc.put(obj: .ROOT, key: "a", value: .String("1"))
+        doc.commitWith()
+        try await subsystem.saveDoc(id: id, doc: doc) // incremental; nothing to compact yet
+
+        // make the document big enough relative to its (absent) base that the next save compacts, and
+        // have that compaction's write fail
+        try doc.put(obj: .ROOT, key: "b", value: .String(String(repeating: "x", count: 2000)))
+        doc.commitWith()
+        await provider.setWritesFail(true)
+        do {
+            try await subsystem.saveDoc(id: id, doc: doc)
+            XCTFail("expected the failing write to surface")
+        } catch is ControllableStorage.WriteFailed {}
+        await provider.setWritesFail(false)
+
+        // a later save must be able to compact again
+        try doc.put(obj: .ROOT, key: "c", value: .String("3"))
+        doc.commitWith()
+        try await subsystem.saveDoc(id: id, doc: doc)
+        let base = try await provider.load(id: id)
+        XCTAssertNotNil(base, "compaction stayed switched off after the failed attempt")
+        let fresh = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let reloaded = try await fresh.loadDoc(id: id)
+        XCTAssertEqual(try XCTUnwrap(reloaded).heads(), doc.heads())
+    }
+
+    func testLoadDoesNotMoveRecordedHeadsBackwards() async throws {
+        let id = DocumentId()
+        let doc = Document()
+        try doc.put(obj: .ROOT, key: "a", value: .String("1"))
+        doc.commitWith()
+        try await subsystem.saveDoc(id: id, doc: doc)
+        let headsAfterFirstSave = doc.heads()
+        // what the provider holds after the first save, to put back later
+        let baseBefore = await testStorageProvider.load(id: id)
+        let chunksBefore = await testStorageProvider.loadRange(id: id, prefix: subsystem.chunkNamespace)
+
+        try doc.put(obj: .ROOT, key: "b", value: .String("2"))
+        doc.commitWith()
+        try await subsystem.saveDoc(id: id, doc: doc)
+        let recorded = await subsystem.latestHeads[id]
+        XCTAssertEqual(recorded, doc.heads())
+
+        // A load that sees less than the save recorded, as a load racing a write in flight would. Stand in
+        // for that by restoring the provider to its state after the first save, and clearing the in-memory
+        // chunks that would otherwise fill the gap.
+        await testStorageProvider.remove(id: id)
+        let chunksNow = await testStorageProvider.loadRange(id: id, prefix: subsystem.chunkNamespace)
+        await testStorageProvider.removeRange(id: id, prefix: subsystem.chunkNamespace, data: chunksNow)
+        if let baseBefore {
+            await testStorageProvider.save(id: id, data: baseBefore)
+        }
+        for chunk in chunksBefore {
+            await testStorageProvider.addToRange(id: id, prefix: subsystem.chunkNamespace, data: chunk)
+        }
+        await { @AutomergeRepo in subsystem.chunks[id] = [] }()
+
+        let loaded = try await subsystem.loadDoc(id: id)
+        XCTAssertEqual(try XCTUnwrap(loaded).heads(), headsAfterFirstSave, "sanity: the load is behind")
+        let afterLoad = await subsystem.latestHeads[id]
+        XCTAssertEqual(afterLoad, doc.heads(), "a load behind the recorded heads must leave them alone")
+
+        // a subsystem with nothing recorded still learns the heads from its first load
+        let fresh = DocumentStorage(testStorageProvider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        _ = try await fresh.loadDoc(id: id)
+        let learned = await fresh.latestHeads[id]
+        XCTAssertEqual(learned, headsAfterFirstSave)
+    }
+
     func testSubsystemPurgeDoc() async throws {
         let newDoc = try RepoHelpers.documentWithData()
         let newDocId = DocumentId()

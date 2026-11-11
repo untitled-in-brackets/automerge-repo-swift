@@ -48,10 +48,24 @@ final class DocumentStorage {
         _storage.id
     }
 
-    /// Removes a document from persistent storage.
+    /// Removes a document from persistent storage: its base snapshot and every incremental chunk.
     /// - Parameter id: The id of the document to remove.
+    ///
+    /// Forgets what this instance remembered about the document as well, so a later load or save
+    /// starts from nothing rather than from heads and chunks that no longer exist.
     public func purgeDoc(id: DocumentId) async throws {
+        // Load the chunk list first: a provider's `remove` only covers the base snapshot, and a
+        // document saved since its last compaction may exist only as chunks.
+        let storageChunks = try await _storage.loadRange(id: id, prefix: chunkNamespace)
         try await _storage.remove(id: id)
+        if !storageChunks.isEmpty {
+            try await _storage.removeRange(id: id, prefix: chunkNamespace, data: storageChunks)
+        }
+        chunks.removeValue(forKey: id)
+        latestHeads.removeValue(forKey: id)
+        storedChunkSize.removeValue(forKey: id)
+        memoryChunkSize.removeValue(forKey: id)
+        storedDocSize.removeValue(forKey: id)
     }
 
     /// Returns an existing document, or nil, for the document Id you provide.
@@ -98,7 +112,12 @@ final class DocumentStorage {
         }
         storedChunkSize[id] = storedChunks
         let combinedDoc = try Document(combined, logLevel: documentLogLevel)
-        latestHeads[id] = combinedDoc.heads()
+        // `latestHeads` records what is known to be on disk. A load that races a save in flight can
+        // see fewer chunks than the save has recorded, so never move the heads backwards here; the
+        // save paths own that value once it exists. An extra chunk is harmless, a skipped save is not.
+        if latestHeads[id] == nil {
+            latestHeads[id] = combinedDoc.heads()
+        }
 
         return combinedDoc
     }
@@ -168,6 +187,8 @@ final class DocumentStorage {
     ///   - doc: The document to compact.
     public func compact(id: DocumentId, doc: Document) async throws {
         compacting = true
+        // A storage error below must not leave compaction switched off for the rest of the process.
+        defer { compacting = false }
         let providedData = doc.save()
         var combined: Data = if let baseData = try await _storage.load(id: id) {
             // loading all the changes from the base document and any incremental saves available
@@ -223,8 +244,6 @@ final class DocumentStorage {
             .reduce(0) { incrSize, data in
                 incrSize + data.count
             }
-
-        compacting = false
     }
 
     /// Save incremental changes of the existing Automerge document.
