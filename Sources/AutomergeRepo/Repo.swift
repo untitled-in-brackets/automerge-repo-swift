@@ -42,7 +42,9 @@ public final class Repo {
 
     private let maxRetriesForFetch: Int
     private let pendingRequestWaitDuration: Duration
-    private var pendingRequestReadAttempts: [DocumentId: Int] = [:]
+    /// When each outstanding remote request gives up. One deadline per document, so several callers
+    /// waiting on the same document share it instead of each shortening the other's wait.
+    private var requestDeadlines: [DocumentId: ContinuousClock.Instant] = [:]
 
     private var remoteHeadsGossipingEnabled = false
 
@@ -1070,7 +1072,7 @@ public final class Repo {
                         return try await resolveDocHandle(id: id)
                     } else {
                         handle.state = .requesting
-                        pendingRequestReadAttempts[id] = 0
+                        requestDeadlines[id] = .now + pendingRequestWaitDuration * maxRetriesForFetch
                         if loglevel.canTrace() {
                             Logger.resolver.trace("RESOLVE: :: \(id) -> [\(String(describing: handle.state))]")
                             Logger.resolver.trace("RESOLVE: :: starting remote fetch")
@@ -1088,42 +1090,39 @@ public final class Repo {
                     Logger.resolver.error("RESOLVE: :: Missing \(id) -> [UNAVAILABLE]")
                     throw Errors.Unavailable(id: handle.id)
                 }
-                if updatedHandle.doc != nil, updatedHandle.state == .ready {
-                    // this may not be needed... but i'm being paranoid about when the change happens
-                    // due to re-entrancy and all the awaits in this method
+                if updatedHandle.state != .requesting {
+                    // a peer answered, an import supplied it, or it was deleted while we slept
+                    requestDeadlines.removeValue(forKey: id)
                     return try await resolveDocHandle(id: id)
-                } else {
-                    guard let previousRequests = pendingRequestReadAttempts[id] else {
-                        Logger.resolver
-                            .error("RESOLVE: :: Missing \(id) from pending request read attempts -> [UNAVAILABLE]")
-                        throw Errors.Unavailable(id: id)
-                    }
-                    if previousRequests < maxRetriesForFetch {
-                        // we are racing against the receipt of a network result
-                        // to see what we get at the end
-                        if loglevel.canTrace() {
-                            Logger.resolver.trace("RESOLVE: :: \(id) -> [\(String(describing: handle.state))]")
-                            Logger.resolver
-                                .trace(
-                                    "RESOLVE: :: check # \(previousRequests) (of \(self.maxRetriesForFetch), waiting \(self.pendingRequestWaitDuration) seconds for remote fetch"
-                                )
-                        }
-                        try await Task.sleep(for: pendingRequestWaitDuration)
-                        pendingRequestReadAttempts[id] = previousRequests + 1
-                        if loglevel.canTrace() {
-                            Logger.resolver.trace("RESOLVE: :: continuing to resolve")
-                        }
-                        return try await resolveDocHandle(id: id)
-                    } else {
-                        updatedHandle.state = .unavailable
-                        docHandlePublisher.send(handle.snapshot())
-                        Logger.resolver
-                            .error(
-                                "RESOLVE: :: failed waiting \(previousRequests) of \(self.maxRetriesForFetch) requests for  \(id) -> [UNAVAILABLE]"
-                            )
-                        throw Errors.Unavailable(id: id)
-                    }
                 }
+                guard let deadline = requestDeadlines[id] else {
+                    Logger.resolver.error("RESOLVE: :: Missing \(id) from pending request deadlines -> [UNAVAILABLE]")
+                    throw Errors.Unavailable(id: id)
+                }
+                if ContinuousClock.now < deadline {
+                    // we are racing against the receipt of a network result; every caller waiting on this
+                    // document sleeps against the same deadline
+                    if loglevel.canTrace() {
+                        Logger.resolver.trace("RESOLVE: :: \(id) -> [\(String(describing: handle.state))]")
+                        Logger.resolver
+                            .trace(
+                                "RESOLVE: :: waiting \(self.pendingRequestWaitDuration) for remote fetch, \(deadline - .now) until giving up"
+                            )
+                    }
+                    try await Task.sleep(for: pendingRequestWaitDuration)
+                    if loglevel.canTrace() {
+                        Logger.resolver.trace("RESOLVE: :: continuing to resolve")
+                    }
+                    return try await resolveDocHandle(id: id)
+                }
+                requestDeadlines.removeValue(forKey: id)
+                updatedHandle.state = .unavailable
+                docHandlePublisher.send(handle.snapshot())
+                Logger.resolver
+                    .error(
+                        "RESOLVE: :: gave up waiting \(self.pendingRequestWaitDuration * self.maxRetriesForFetch) for \(id) -> [UNAVAILABLE]"
+                    )
+                throw Errors.Unavailable(id: id)
             case .ready:
                 guard let doc = handle.doc else { fatalError("DocHandle state is ready, but ._doc is null") }
                 if loglevel.canTrace() {

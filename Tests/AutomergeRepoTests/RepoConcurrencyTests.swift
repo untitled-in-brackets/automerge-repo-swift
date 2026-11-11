@@ -70,4 +70,19 @@ final class RepoConcurrencyTests: XCTestCase {
         let generatesNothingNew = handle.doc.generateSyncMessage(state: stored) == nil
         XCTAssertTrue(generatesNothingNew, "the stored state already covers the offer that went out")
     }
+
+    // MARK: Concurrent finds share one deadline
+
+    func testConcurrentFindsForTheSameMissingDocumentWaitTheFullTimeout() async throws {
+        let deadline: Duration = .milliseconds(600)
+        let (repo, _) = await peerRepo(fetchDeadline: deadline)
+        let id = DocumentId()
+        let clock = ContinuousClock()
+        async let first = clock.measure { _ = try? await repo.find(id: id) }
+        async let second = clock.measure { _ = try? await repo.find(id: id) }
+        let (a, b) = await (first, second)
+        // each waiter would halve the other's wait if they shared a retry counter
+        XCTAssertGreaterThanOrEqual(a, deadline - .milliseconds(50), "\(a)")
+        XCTAssertGreaterThanOrEqual(b, deadline - .milliseconds(50), "\(b)")
+    }
 }
