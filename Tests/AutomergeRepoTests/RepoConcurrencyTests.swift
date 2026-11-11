@@ -131,4 +131,46 @@ final class RepoConcurrencyTests: XCTestCase {
         XCTAssertTrue(handle.doc.equivalentContents(peerCopy))
         XCTAssertLessThan(found, .seconds(2), "the find must not go on to request a document it already has")
     }
+
+    // MARK: Edits from another thread
+
+    func testEditsFromABackgroundThreadStillSyncAndSave() async throws {
+        let storage = ControllableStorage()
+        let (repo, adapter) = await peerRepo(storage: storage)
+        let handle = try await repo.create()
+        await adapter.clearSent()
+        let writesBefore = await storage.writeCount
+
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            try? handle.doc.put(obj: .ROOT, key: "k", value: .String("v"))
+            handle.doc.commitWith()
+            done.signal()
+        }
+        done.wait()
+
+        let synced = await waitUntil { await !adapter.sent.isEmpty }
+        XCTAssertTrue(synced, "the edit should reach the peer")
+        try await repo.savePendingChanges(id: handle.id)
+        let writesAfter = await storage.writeCount
+        XCTAssertGreaterThan(writesAfter, writesBefore)
+    }
+
+    func testABurstOfEditsProducesFewSyncPasses() async throws {
+        let (repo, adapter) = await peerRepo()
+        let handle = try await repo.create()
+        _ = await waitUntil { await !adapter.sent.isEmpty } // the create's own offer
+        await adapter.clearSent()
+
+        let edits = 50
+        for i in 0..<edits {
+            try handle.doc.put(obj: .ROOT, key: "k\(i)", value: .String("\(i)"))
+        }
+        handle.doc.commitWith()
+        let settled = await waitUntil { await !adapter.sent.isEmpty }
+        XCTAssertTrue(settled)
+        try await Task.sleep(for: .milliseconds(200))
+        let sent = await adapter.sent
+        XCTAssertLessThan(sent.count, edits / 5, "\(edits) edits should coalesce into a few syncs, got \(sent.count)")
+    }
 }

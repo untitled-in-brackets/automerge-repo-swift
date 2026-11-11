@@ -14,6 +14,8 @@ public final class Repo {
 
     private var handles: [DocumentId: InternalDocHandle] = [:]
     private var observerHandles: [DocumentId: AnyCancellable] = [:]
+    /// Documents with a sync pass scheduled but not yet run; a burst of edits produces one pass.
+    private var syncScheduled: Set<DocumentId> = []
     private var storage: DocumentStorage?
     private var network: NetworkSubsystem
 
@@ -284,15 +286,19 @@ public final class Repo {
         saveSignalHandler = saveSignalPublisher
             .debounce(for: saveDebounceDelay, scheduler: RunLoop.main)
             .sink(receiveValue: { [weak self] id in
-                guard let self,
-                      let storage = self.storage,
-                      let docHandle = self.handles[id],
-                      let docFromHandle = docHandle.doc
-                else {
-                    return
-                }
-                Task {
-                    try await storage.saveDoc(id: id, doc: docFromHandle)
+                // Combine delivers this on the main run loop, not on the repo's actor. Hop before
+                // touching any repo state.
+                Task { @AutomergeRepo [weak self] in
+                    guard let self, let storage = self.storage, let doc = self.handles[id]?.doc else {
+                        return
+                    }
+                    do {
+                        try await storage.saveDoc(id: id, doc: doc)
+                    } catch {
+                        Logger.repo.warning(
+                            "REPO: Error saving document \(id): \(error.localizedDescription, privacy: .public)"
+                        )
+                    }
                 }
             })
     }
@@ -419,15 +425,32 @@ public final class Repo {
             return
         }
         if let doc = handle.doc, handle.state == .ready, observerHandles[id] == nil {
-            // sync changes should be invoked as rapidly as possible to allow for best possible
-            // collaborative editing experiences.
+            // `objectWillChange` fires synchronously on whichever thread is mutating the document,
+            // which is the app's, not this actor's. The compiler infers this closure as actor-isolated
+            // and would let it read repo state directly; it must only hop.
             let handleObserver = doc.objectWillChange
                 .sink { [weak self] _ in
-                    guard let self else { return }
-                    self.saveSignalPublisher.send(id)
-                    syncToAllPeers(id: id)
+                    Task { @AutomergeRepo [weak self] in
+                        self?.documentDidChange(id: id)
+                    }
                 }
             observerHandles[id] = handleObserver
+        }
+    }
+
+    /// Reacts to a local edit of `id`: signals the debounced save and schedules one sync pass.
+    ///
+    /// Edits arrive one `objectWillChange` at a time, so a burst of them would otherwise start a sync
+    /// pass each. The first schedules a pass and later ones in the same burst do nothing; the pass
+    /// generates from the live document, so it carries every edit made before it runs.
+    private func documentDidChange(id: DocumentId) {
+        saveSignalPublisher.send(id)
+        guard !syncScheduled.contains(id) else { return }
+        syncScheduled.insert(id)
+        Task { @AutomergeRepo in
+            await Task.yield()
+            syncScheduled.remove(id)
+            syncToAllPeers(id: id)
         }
     }
 
