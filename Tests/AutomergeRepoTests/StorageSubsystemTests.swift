@@ -207,15 +207,11 @@ final class StorageSubsystemTests: XCTestCase {
         let provider = ControllableStorage()
         let subsystem = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
         let id = DocumentId()
-        let doc = Document()
-        try doc.put(obj: .ROOT, key: "a", value: .String("1"))
-        doc.commitWith()
+        let doc = try RepoHelpers.documentWithData()
         try await subsystem.saveDoc(id: id, doc: doc)
-        // large enough that the next save compacts; its snapshot write is slow
-        try doc.put(obj: .ROOT, key: "b", value: .String(String(repeating: "x", count: 2000)))
-        doc.commitWith()
+        // the compaction's snapshot write is slow; the purge runs while it is in flight
         await provider.queueWriteDelays([.milliseconds(300)])
-        let straddlingCompaction = Task { try await subsystem.saveDoc(id: id, doc: doc) }
+        let straddlingCompaction = Task { try await subsystem.compact(id: id, doc: doc) }
         try await Task.sleep(for: .milliseconds(50))
         try await subsystem.purgeDoc(id: id)
         try await straddlingCompaction.value
@@ -289,6 +285,7 @@ final class StorageSubsystemTests: XCTestCase {
         let id = DocumentId()
         let doc = try RepoHelpers.documentWithData()
         try await saveToBaseSnapshot(doc, id: id, in: subsystem, provider: provider)
+        let headsBeforeEdits = doc.heads()
 
         // the incremental save's write is slow; the compaction's snapshot write, which starts later,
         // is slower still and then fails
@@ -308,7 +305,12 @@ final class StorageSubsystemTests: XCTestCase {
         } catch is ControllableStorage.WriteFailed {}
         await provider.setWritesFail(false)
 
-        // the small edit is on disk in the straddling chunk; a fresh load has it
+        // the small edit is on disk in the straddling chunk, and the saved heads were not advanced past
+        // it by either side, so nothing believes it stored more than is there
+        let chunks = try await provider.loadRange(id: id, prefix: subsystem.chunkNamespace)
+        XCTAssertEqual(chunks.count, 1, "the straddling chunk stays on disk")
+        let heads = await subsystem.latestHeads[id]
+        XCTAssertEqual(heads, headsBeforeEdits, "neither the failed compaction nor the straddler may advance the heads")
         let fresh = DocumentStorage(provider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
         let reloaded = try await fresh.loadDoc(id: id)
         XCTAssertEqual(try XCTUnwrap(reloaded).get(obj: .ROOT, key: "small"), .Scalar(.String("edit")))
@@ -332,12 +334,16 @@ final class StorageSubsystemTests: XCTestCase {
         // have that compaction's write fail
         try doc.put(obj: .ROOT, key: "b", value: .String(String(repeating: "x", count: 2000)))
         doc.commitWith()
+        let willCompact = try await subsystem.shouldCompact(id)
+        XCTAssertTrue(willCompact, "precondition: the next save is a compaction")
         await provider.setWritesFail(true)
         do {
             try await subsystem.saveDoc(id: id, doc: doc)
             XCTFail("expected the failing write to surface")
         } catch is ControllableStorage.WriteFailed {}
         await provider.setWritesFail(false)
+        let stillCompacting = await subsystem.compacting
+        XCTAssertFalse(stillCompacting, "a failed compaction must not leave the flag set")
 
         // a later save must be able to compact again
         try doc.put(obj: .ROOT, key: "c", value: .String("3"))
