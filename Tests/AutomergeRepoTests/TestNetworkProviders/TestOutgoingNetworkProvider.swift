@@ -133,7 +133,8 @@ public final class TestOutgoingNetworkProvider: NetworkProvider {
             await delegate?.receiveEvent(
                 event: .peerCandidate(
                     payload: initialPeerConnection
-                )
+                ),
+                from: self
             )
             try await Task.sleep(for: .milliseconds(250))
             let finalPeerConnection = PeerConnectionInfo(
@@ -146,7 +147,8 @@ public final class TestOutgoingNetworkProvider: NetworkProvider {
             await delegate?.receiveEvent(
                 event: .ready(
                     payload: finalPeerConnection
-                )
+                ),
+                from: self
             )
             connected = true
 
@@ -166,7 +168,7 @@ public final class TestOutgoingNetworkProvider: NetworkProvider {
     public func send(message: SyncV1Msg, to _: PEER_ID?) async {
         messages.append(message)
         if let response = await config?.msgResponse(message) {
-            await delegate?.receiveEvent(event: .message(payload: response))
+            await delegate?.receiveEvent(event: .message(payload: response), from: self)
         }
     }
 
@@ -191,7 +193,10 @@ public final class TestOutgoingNetworkProvider: NetworkProvider {
         }
         if connected {
             connected = false
-            await delegate?.receiveEvent(event: .peerDisconnect(payload: .init(peerId: config.remotePeer)))
+            await delegate?.receiveEvent(
+                event: .peerDisconnect(payload: .init(peerId: config.remotePeer)),
+                from: self
+            )
         }
     }
 

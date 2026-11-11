@@ -31,11 +31,21 @@ final class NetworkSubsystem {
     // TODO: revisit this and consider if the callbacks to repo should be exposed as a delegate
     weak var repo: Repo?
     var adapters: [any NetworkProvider]
+    /// The adapter that reached each peer, so a message addressed to a peer goes out only on that adapter.
+    ///
+    /// Populated when an adapter reports `.ready` or `.peerCandidate` for a peer, and cleared when it reports
+    /// `.peerDisconnect` for that peer or `.close`. Mirrors `#adaptersByPeer` in the JS `NetworkSubsystem`.
+    private(set) var adaptersByPeer: [PEER_ID: any NetworkProvider] = [:]
     var loglevel: LogVerbosity
 
     nonisolated init(verbosity: LogVerbosity) {
         adapters = []
         self.loglevel = verbosity
+    }
+
+    /// Identity comparison for two adapters; every shipped provider is a class.
+    private static func isSame(_ lhs: any NetworkProvider, _ rhs: any NetworkProvider) -> Bool {
+        (lhs as AnyObject) === (rhs as AnyObject)
     }
 
     func setRepo(_ repo: Repo) {
@@ -52,6 +62,36 @@ final class NetworkSubsystem {
         }
         adapter.setDelegate(self, as: peerId, with: repo?.localPeerMetadata)
         adapters.append(adapter)
+    }
+
+    /// Stops routing through `adapter`, disconnects it, and forgets the peers it reached.
+    ///
+    /// The adapter leaves the list first, so nothing it reports while disconnecting is acted on; the peers
+    /// it owned routes for are then removed from the repo directly. Removing an unknown adapter is a no-op.
+    func removeAdapter(adapter: any NetworkProvider) async {
+        guard let index = adapters.firstIndex(where: { Self.isSame($0, adapter) }) else {
+            if loglevel.canTrace() {
+                Logger.network.trace("REPONET: ignoring removal of unknown adapter \(String(describing: adapter))")
+            }
+            return
+        }
+        adapters.remove(at: index)
+        if loglevel.canTrace() {
+            Logger.network.trace("REPONET: removing adapter \(String(describing: adapter))")
+        }
+        await adapter.disconnect()
+        let orphaned = adaptersByPeer.filter { Self.isSame($0.value, adapter) }.map(\.key)
+        for peerId in orphaned {
+            if loglevel.canTrace() {
+                Logger.network.trace("REPONET: dropping route for peer \(peerId), adapter removed")
+            }
+            adaptersByPeer.removeValue(forKey: peerId)
+            repo?.removePeer(peer: peerId)
+        }
+    }
+
+    private func isKnown(_ adapter: any NetworkProvider) -> Bool {
+        adapters.contains { Self.isSame($0, adapter) }
     }
 
     func startRemoteFetch(id: DocumentId) async throws {
@@ -103,13 +143,68 @@ final class NetworkSubsystem {
         }
     }
 
+    /// Sends a message to a peer, or to every adapter when no peer is given.
+    ///
+    /// A message addressed to a peer goes out only on the adapter that reached that peer. When no adapter has
+    /// reported that peer, the message is logged and dropped rather than broadcast, matching the JS library.
     func send(message: SyncV1Msg, to: PEER_ID?) async {
+        if let to {
+            guard let adapter = adaptersByPeer[to] else {
+                Logger.network
+                    .warning(
+                        "REPONET: no adapter is peered with \(to, privacy: .public), dropping \(message.debugDescription, privacy: .public)"
+                    )
+                return
+            }
+            if loglevel.canTrace() {
+                Logger.network
+                    .trace("REPONET: sending message on \(String(describing: adapter)) to \(to)")
+            }
+            await adapter.send(message: message, to: to)
+            return
+        }
         for adapter in adapters {
             if loglevel.canTrace() {
                 Logger.network
-                    .trace("REPONET: sending message on \(String(describing: adapter)) to \(String(describing: to))")
+                    .trace("REPONET: broadcasting message on \(String(describing: adapter))")
             }
-            await adapter.send(message: message, to: to)
+            await adapter.send(message: message, to: nil)
+        }
+    }
+
+    // MARK: Routing table maintenance
+
+    private func recordPeer(_ peerId: PEER_ID, on adapter: any NetworkProvider) {
+        if loglevel.canTrace() {
+            Logger.network.trace("REPONET: routing peer \(peerId) through \(String(describing: adapter))")
+        }
+        adaptersByPeer[peerId] = adapter
+    }
+
+    /// Forgets the route for a peer. When the reporting adapter is known, only its own route is dropped, so a
+    /// stale connection closing after a replacement has peered with the same peer leaves the new route alone.
+    private func forgetPeer(_ peerId: PEER_ID, on adapter: (any NetworkProvider)?) {
+        guard let current = adaptersByPeer[peerId] else { return }
+        if let adapter, !Self.isSame(current, adapter) {
+            if loglevel.canTrace() {
+                Logger.network
+                    .trace("REPONET: ignoring disconnect of \(peerId) from \(String(describing: adapter)), routed elsewhere")
+            }
+            return
+        }
+        if loglevel.canTrace() {
+            Logger.network.trace("REPONET: dropping route for peer \(peerId)")
+        }
+        adaptersByPeer.removeValue(forKey: peerId)
+    }
+
+    private func forgetAllPeers(on adapter: any NetworkProvider) {
+        let peers = adaptersByPeer.filter { Self.isSame($0.value, adapter) }.map(\.key)
+        for peerId in peers {
+            if loglevel.canTrace() {
+                Logger.network.trace("REPONET: dropping route for peer \(peerId), adapter closed")
+            }
+            adaptersByPeer.removeValue(forKey: peerId)
         }
     }
 }
@@ -122,8 +217,26 @@ extension NetworkSubsystem: NetworkEventReceiver {
     // In automerge-repo code, it appears to update information on an ephemeral information (
     // a sort of middleware) before emitting it upwards.
     public func receiveEvent(event: NetworkAdapterEvents) async {
+        await handle(event: event, from: nil)
+    }
+
+    public func receiveEvent(event: NetworkAdapterEvents, from adapter: any NetworkProvider) async {
+        await handle(event: event, from: adapter)
+    }
+
+    /// Handles an event from an adapter. Without the adapter, the routing table isn't updated, so messages
+    /// addressed to peers the anonymous adapter reports are dropped by ``send(message:to:)``. Events from an
+    /// adapter that has been removed are ignored.
+    private func handle(event: NetworkAdapterEvents, from adapter: (any NetworkProvider)?) async {
         if loglevel.canTrace() {
             Logger.network.trace("REPONET: received event from network adapter: \(event.debugDescription)")
+        }
+        if let adapter, !isKnown(adapter) {
+            if loglevel.canTrace() {
+                Logger.network
+                    .trace("REPONET: ignoring \(event.debugDescription) from removed adapter \(String(describing: adapter))")
+            }
+            return
         }
         guard let repo else {
             // No-op if there's no repo to update state or handle
@@ -132,13 +245,22 @@ extension NetworkSubsystem: NetworkEventReceiver {
         }
         switch event {
         case let .ready(payload):
+            if let adapter {
+                recordPeer(payload.peerId, on: adapter)
+            }
             await repo.addPeerWithMetadata(peer: payload.peerId, metadata: payload.peerMetadata)
         case .close:
-            break
+            if let adapter {
+                forgetAllPeers(on: adapter)
+            }
         // attempt to reconnect, or remove from active adapters?
         case let .peerCandidate(payload):
+            if let adapter {
+                recordPeer(payload.peerId, on: adapter)
+            }
             await repo.addPeerWithMetadata(peer: payload.peerId, metadata: payload.peerMetadata)
         case let .peerDisconnect(payload):
+            forgetPeer(payload.peerId, on: adapter)
             repo.removePeer(peer: payload.peerId)
         case let .message(payload):
             switch payload {

@@ -172,10 +172,13 @@ public final class WebSocketProvider: NetworkProvider {
 
         if let connectedPeer = peeredConnections.first {
             peeredConnections.removeAll()
-            await delegate?.receiveEvent(event: .peerDisconnect(payload: .init(peerId: connectedPeer.peerId)))
+            await delegate?.receiveEvent(
+                event: .peerDisconnect(payload: .init(peerId: connectedPeer.peerId)),
+                from: self
+            )
         }
 
-        await delegate?.receiveEvent(event: .close)
+        await delegate?.receiveEvent(event: .close, from: self)
     }
 
     /// Whether a later attempt could succeed. Only an HTTP rejection of the upgrade can say no.
@@ -346,7 +349,7 @@ public final class WebSocketProvider: NetworkProvider {
             // set _before_ the delegate hears we're peered, because that (can) trigger a sync
             self.webSocketTask = webSocketTask
 
-            await delegate.receiveEvent(event: .ready(payload: peerConnectionDetails))
+            await delegate.receiveEvent(event: .ready(payload: peerConnectionDetails), from: self)
             _statePublisher.send(.ready)
             if config.logLevel.canTrace() {
                 Logger.websocket.trace("WEBSOCKET: Peered to targetId: \(peerMsg.senderId) \(peerMsg.debugDescription)")
@@ -577,7 +580,7 @@ public final class WebSocketProvider: NetworkProvider {
         case let .peer(msg):
             Logger.websocket.error("WEBSOCKET: Unexpected message received: \(msg.debugDescription)")
         default:
-            await delegate?.receiveEvent(event: .message(payload: msg))
+            await delegate?.receiveEvent(event: .message(payload: msg), from: self)
             if config.logLevel.canTrace() {
                 Logger.websocket.trace("WEBSOCKET: FWD TO DELEGATE: \(msg.debugDescription)")
             }
