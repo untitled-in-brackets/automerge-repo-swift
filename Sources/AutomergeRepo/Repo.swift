@@ -358,29 +358,34 @@ public final class Repo {
         }
     }
 
+    /// Offers `docId` to `peer` if the share policy allows and the document is in hand.
+    ///
+    /// A document still loading from storage or being requested from peers is not offered: waiting on
+    /// it here would hold up whatever called this, which for a new connection is every other document
+    /// and the provider's own event delivery. ``updateDoc`` offers such a document to every peer once
+    /// it arrives.
     func beginSync(docId: DocumentId, to peer: PEER_ID) async {
         if await sharePolicy.share(peer: peer, docId: docId) {
+            // the share policy may have suspended; read the handle only now
+            guard let handle = handles[docId], let doc = handle.doc, handle.state == .ready else {
+                if logLevel(.repo).canTrace() {
+                    Logger.repo.trace("REPO: \(self.peerId) not offering \(docId) to \(peer), document not in hand")
+                }
+                return
+            }
             if logLevel(.repo).canTrace() {
                 Logger.repo.trace("REPO: \(self.peerId) starting a sync for document \(docId) to \(peer)")
             }
-            do {
-                let handle = try await resolveDocHandle(id: docId)
-                let syncState = syncState(id: docId, peer: peer)
-                if let syncData = handle.doc.generateSyncMessage(state: syncState) {
-                    let syncMsg: SyncV1Msg = .sync(.init(
-                        documentId: docId.description,
-                        senderId: peerId,
-                        targetId: peer,
-                        sync_message: syncData
-                    ))
-                    syncRequestPublisher.send(SyncRequest(id: docId, peer: peer))
-                    await network.send(message: syncMsg, to: peer)
-                }
-            } catch {
-                Logger.repo
-                    .error(
-                        "REPO: \(self.peerId) Failed to generate sync on peer connection: \(error.localizedDescription, privacy: .public)"
-                    )
+            let syncState = syncState(id: docId, peer: peer)
+            if let syncData = doc.generateSyncMessage(state: syncState) {
+                let syncMsg: SyncV1Msg = .sync(.init(
+                    documentId: docId.description,
+                    senderId: peerId,
+                    targetId: peer,
+                    sync_message: syncData
+                ))
+                syncRequestPublisher.send(SyncRequest(id: docId, peer: peer))
+                await network.send(message: syncMsg, to: peer)
             }
         } else {
             if logLevel(.repo).canTrace() {
@@ -558,16 +563,32 @@ public final class Repo {
         if let internalHandle = handles[docId], internalHandle.state != .deleted {
             // If we have the document, see if we're agreeable to sending a copy
             if await sharePolicy.share(peer: msg.senderId, docId: docId) {
+                // Answer from what is in hand. A document still being requested from peers is not ours
+                // to give: say so now rather than wait for it here, which would block this adapter's
+                // event delivery, and offer it through `updateDoc` if it arrives. samod does the same.
+                guard let handle = handles[docId], handle.doc != nil,
+                      ![.deleted, .requesting, .unavailable].contains(handle.state)
+                else {
+                    let nope = SyncV1Msg.UnavailableMsg(
+                        documentId: msg.documentId,
+                        senderId: peerId,
+                        targetId: msg.senderId
+                    )
+                    await network.send(message: .unavailable(nope), to: msg.senderId)
+                    return
+                }
                 do {
-                    let handle = try await resolveDocHandle(id: docId)
+                    // a document in hand resolves without waiting on peers
+                    let resolved = try await resolveDocHandle(id: docId)
+                    let doc = resolved.doc
                     let syncState = syncState(id: docId, peer: msg.senderId)
                     // Apply the request message as a sync update
-                    let patches = try handle.doc.receiveSyncMessageWithPatches(state: syncState, message: msg.data)
+                    let patches = try doc.receiveSyncMessageWithPatches(state: syncState, message: msg.data)
                     // Stash the sync state, then the document (which publishes any change before saving)
                     await updateSyncState(id: docId, peer: msg.senderId, syncState: syncState)
-                    await updateDoc(id: docId, doc: handle.doc, applied: patches, from: .sync(peer: msg.senderId))
+                    await updateDoc(id: docId, doc: doc, applied: patches, from: .sync(peer: msg.senderId))
                     // Attempt to generate a sync message to reply
-                    if let syncData = handle.doc.generateSyncMessage(state: syncState) {
+                    if let syncData = doc.generateSyncMessage(state: syncState) {
                         let syncMsg: SyncV1Msg = .sync(.init(
                             documentId: docId.description,
                             senderId: peerId,
@@ -659,18 +680,10 @@ public final class Repo {
     @discardableResult
     public func `import`(handle: DocHandle) async throws -> DocHandle {
         if let existingHandle = handles[handle.id] {
-            if [.loading, .requesting].contains(existingHandle.state) {
-                // The state of the internal handle is in .requesting or .loading, meaning those
-                // processes are in place, or were in place and aborted. To resolve any potential
-                // concurrency issues, we'll resolve to a known state that we can handle and continue
-                // with merging from there.
-                do {
-                    let _ = try await resolveDocHandle(id: existingHandle.id)
-                } catch {
-                    // intentionally catch errors to indicate that the state is resolved
-                    // so that we can continue
-                }
-            }
+            // A handle that is `.loading` or `.requesting` has a `find` in flight. Do not wait on it: a
+            // request to peers can take the whole fetch timeout. Merging into (or supplying) the document
+            // here and marking the handle ready is what that `find` is waiting for, and a storage load
+            // that returns afterwards merges its copy in rather than replacing this one.
             // verify that the document exists on the handle, and if so, merge
             let mergedDoc: Document
             var mergePatches: [Patch] = []
@@ -951,11 +964,19 @@ public final class Repo {
         // assertion, we we later receive the SYNC update to set the document as expected. A sync can also
         // land while the handle is `.loading`, between `find` starting a storage load and it returning.
         assert([.ready, .unavailable, .requesting, .loading].contains(handle.state))
+        let wasReady = handle.state == .ready
         handle.doc = doc
         handle.state = .ready
         docHandlePublisher.send(handle.snapshot())
         if let source {
             publishChange(id: id, patches: patches, doc: doc, source: source)
+        }
+        if !wasReady {
+            // The document has just arrived. Peers that asked for it while it was still being requested
+            // were told it was unavailable, and a peer that connected meanwhile was not offered it; both
+            // get it now, through the share policy, the way any other document would be.
+            watchDocForChanges(id: id)
+            syncToAllPeers(id: id)
         }
         if let storage {
             do {

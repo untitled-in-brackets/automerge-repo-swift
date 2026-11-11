@@ -173,4 +173,87 @@ final class RepoConcurrencyTests: XCTestCase {
         let sent = await adapter.sent
         XCTAssertLessThan(sent.count, edits / 5, "\(edits) edits should coalesce into a few syncs, got \(sent.count)")
     }
+
+    // MARK: Requests for a document the repo is still requesting
+
+    func testRequestForADocumentWeAreRequestingIsAnsweredImmediately() async throws {
+        let (repo, adapter) = await peerRepo(fetchDeadline: .seconds(10))
+        let id = DocumentId()
+        let find = Task { try await repo.find(id: id) }
+        _ = await waitUntil { await adapter.sent.contains { if case .request = $0.message { true } else { false } } }
+        await adapter.clearSent()
+
+        // a second peer asks us for the same document
+        let other = RecordingNetworkProvider(name: "other")
+        await repo.addNetworkAdapter(adapter: other)
+        await other.peer(with: "other-peer")
+        let request = SyncV1Msg.RequestMsg(
+            documentId: id.description,
+            senderId: "other-peer",
+            targetId: repo.peerId,
+            sync_message: try XCTUnwrap(Document().generateSyncMessage(state: SyncState()))
+        )
+        let clock = ContinuousClock()
+        let elapsed = await clock.measure { await repo.handleRequest(msg: request) }
+        XCTAssertLessThan(elapsed, .seconds(1), "answering must not wait on our own fetch")
+
+        let answers = await other.sent
+        XCTAssertEqual(answers.count, 1)
+        guard case let .unavailable(msg)? = answers.first?.message else {
+            return XCTFail("expected an unavailable answer, got \(String(describing: answers.first?.message))")
+        }
+        XCTAssertEqual(msg.targetId, "other-peer")
+
+        // the document then arrives from the first peer: the requester is offered it after all
+        let source = try RepoHelpers.documentWithData()
+        await repo.handleSync(msg: try syncMessage(for: id, from: "the-peer", doc: source, to: repo))
+        let found = try await find.value
+        XCTAssertTrue(found.doc.equivalentContents(source))
+        let offered = await waitUntil {
+            await other.sent.contains { if case .sync = $0.message { true } else { false } }
+        }
+        XCTAssertTrue(offered, "once the document is in hand it is synced to the peer that asked")
+    }
+
+    func testANewPeerIsNotHeldUpByADocumentStillBeingRequested() async throws {
+        let (repo, adapter) = await peerRepo(fetchDeadline: .seconds(10))
+        let ready = try await repo.create()
+        try ready.doc.put(obj: .ROOT, key: "ready", value: .String("yes"))
+        ready.doc.commitWith()
+        let pending = DocumentId()
+        let find = Task { try await repo.find(id: pending) }
+        _ = await waitUntil { await adapter.sent.contains { if case .request = $0.message { true } else { false } } }
+
+        // a second peer connects; delivering its .ready must return promptly and offer the ready document
+        let late = RecordingNetworkProvider(name: "late")
+        await repo.addNetworkAdapter(adapter: late)
+        let clock = ContinuousClock()
+        let elapsed = await clock.measure { await late.peer(with: "late-peer") }
+        XCTAssertLessThan(elapsed, .seconds(1), "a pending find must not stall the new peer's connection")
+        let offeredReady = await late.sent.contains { sent in
+            if case let .sync(m) = sent.message { m.documentId == ready.id.description } else { false }
+        }
+        XCTAssertTrue(offeredReady)
+        let offeredPending = await late.sent.contains { sent in
+            if case let .sync(m) = sent.message { m.documentId == pending.description } else { false }
+        }
+        XCTAssertFalse(offeredPending, "nothing to offer for a document we do not hold")
+        find.cancel()
+    }
+
+    func testImportIntoARequestedDocumentDoesNotWaitForPeers() async throws {
+        let (repo, adapter) = await peerRepo(fetchDeadline: .seconds(10))
+        let id = DocumentId()
+        let find = Task { try await repo.find(id: id) }
+        _ = await waitUntil { await adapter.sent.contains { if case .request = $0.message { true } else { false } } }
+
+        let supplied = try RepoHelpers.documentWithData()
+        let clock = ContinuousClock()
+        let elapsed = try await clock.measure {
+            _ = try await repo.import(handle: DocHandle(id: id, doc: supplied))
+        }
+        XCTAssertLessThan(elapsed, .seconds(1))
+        let found = try await find.value
+        XCTAssertTrue(found.doc.equivalentContents(supplied), "the import is what the find was waiting for")
+    }
 }
