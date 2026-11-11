@@ -925,8 +925,9 @@ public final class Repo {
         }
         // Automerge-repo https://github.com/automerge/automerge-repo/issues/343 is sending two responses,
         // the first being UNAVAILABLE, which we use to change the state, but that triggers this unexpected
-        // assertion, we we later receive the SYNC update to set the document as expected
-        assert(handle.state == .ready || handle.state == .unavailable || handle.state == .requesting)
+        // assertion, we we later receive the SYNC update to set the document as expected. A sync can also
+        // land while the handle is `.loading`, between `find` starting a storage load and it returning.
+        assert([.ready, .unavailable, .requesting, .loading].contains(handle.state))
         handle.doc = doc
         handle.state = .ready
         docHandlePublisher.send(handle.snapshot())
@@ -1058,8 +1059,18 @@ public final class Repo {
                     // to load it from storage, and failing that - if the storage provider
                     // doesn't exist, for example - jump forward to attempting to fetch
                     // it from a peer.
-                    if let doc = try await loadFromStorage(id: id) {
-                        handle.doc = doc
+                    let stored = try await loadFromStorage(id: id)
+                    // The load suspended this actor. A sync from a peer, or an import, may have given the
+                    // handle a document meanwhile; the storage copy folds into that rather than replacing it.
+                    if handle.state == .deleted {
+                        return try await resolveDocHandle(id: id)
+                    }
+                    if let stored {
+                        if let current = handle.doc {
+                            try current.merge(other: stored)
+                        } else {
+                            handle.doc = stored
+                        }
                         handle.state = .ready
                         if loglevel.canTrace() {
                             Logger.resolver.trace("RESOLVE: :: loaded \(id) from storage provider")
@@ -1068,6 +1079,11 @@ public final class Repo {
                         if loglevel.canTrace() {
                             Logger.resolver.trace("RESOLVE: :: continuing to resolve")
                         }
+                        docHandlePublisher.send(handle.snapshot())
+                        return try await resolveDocHandle(id: id)
+                    } else if handle.doc != nil {
+                        // nothing in storage, but a peer or an import supplied the document during the load
+                        handle.state = .ready
                         docHandlePublisher.send(handle.snapshot())
                         return try await resolveDocHandle(id: id)
                     } else {

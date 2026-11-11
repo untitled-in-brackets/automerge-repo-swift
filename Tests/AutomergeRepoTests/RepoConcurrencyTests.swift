@@ -85,4 +85,50 @@ final class RepoConcurrencyTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(a, deadline - .milliseconds(50), "\(a)")
         XCTAssertGreaterThanOrEqual(b, deadline - .milliseconds(50), "\(b)")
     }
+
+    // MARK: A sync that lands during a storage load
+
+    func testSyncArrivingDuringAStorageLoadIsKeptAndMergedWithTheStoredCopy() async throws {
+        let storage = ControllableStorage()
+        let (repo, _) = await peerRepo(storage: storage)
+        // a document on disk with one key, and a peer whose copy has a second key on top of it
+        let id = DocumentId()
+        let stored = Document()
+        try stored.put(obj: .ROOT, key: "stored", value: .String("disk"))
+        stored.commitWith()
+        try await storage.save(id: id, data: stored.save())
+        let peerCopy = try Document(stored.save())
+        try peerCopy.put(obj: .ROOT, key: "remote", value: .String("peer"))
+        peerCopy.commitWith()
+
+        await storage.queueLoadDelays([.milliseconds(300)])
+        let find = Task { try await repo.find(id: id) }
+        try await Task.sleep(for: .milliseconds(50)) // find is now suspended in the storage load
+        await repo.handleSync(msg: try syncMessage(for: id, from: "the-peer", doc: peerCopy, to: repo))
+
+        let found = try await find.value
+        XCTAssertEqual(try found.doc.get(obj: .ROOT, key: "stored"), .Scalar(.String("disk")))
+        XCTAssertEqual(try found.doc.get(obj: .ROOT, key: "remote"), .Scalar(.String("peer")))
+        let again = try await repo.find(id: id)
+        XCTAssertTrue(again.doc === found.doc, "one document object, not a storage copy replacing the synced one")
+    }
+
+    func testSyncArrivingDuringAStorageMissIsKept() async throws {
+        let storage = ControllableStorage()
+        let (repo, _) = await peerRepo(storage: storage, fetchDeadline: .seconds(10))
+        let id = DocumentId()
+        let peerCopy = try RepoHelpers.documentWithData()
+
+        await storage.queueLoadDelays([.milliseconds(300)])
+        let find = Task { try await repo.find(id: id) }
+        try await Task.sleep(for: .milliseconds(50))
+        await repo.handleSync(msg: try syncMessage(for: id, from: "the-peer", doc: peerCopy, to: repo))
+
+        let clock = ContinuousClock()
+        let found = try await clock.measure { try await find.value }
+        _ = found
+        let handle = try await repo.find(id: id)
+        XCTAssertTrue(handle.doc.equivalentContents(peerCopy))
+        XCTAssertLessThan(found, .seconds(2), "the find must not go on to request a document it already has")
+    }
 }
