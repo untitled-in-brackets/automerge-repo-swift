@@ -10,15 +10,13 @@ internal import Foundation
 final class DocumentStorage {
     let chunkNamespace = "incrChanges"
     var compacting: Bool
-    /// Bumped whenever a document's chunk set is replaced wholesale: at the start of a compaction and
-    /// of a purge. A save that began before either and finished after it compares this to the value
-    /// it captured and, when they differ, leaves the memos to whoever replaced the set. The same
-    /// scheme as upstream's `#chunkGenerations`.
+    /// Bumped at the start of a compaction. A save that began before it and finished after it
+    /// compares this to the value it captured and, when they differ, leaves the heads memo to the
+    /// compaction: its chunk is redundant but stays, so that a compaction whose snapshot write then
+    /// fails has not cost the changes their only copy on disk. Upstream's `#chunkGenerations`.
     var chunkGeneration: [DocumentId: Int] = [:]
-    /// Bumped at the start of a purge only. A save that finds this moved also takes its own write
-    /// back out: after a purge the write is an orphan. After a compaction it is merely redundant, and
-    /// stays, so that a compaction whose snapshot write then fails has not cost the changes their
-    /// only copy on disk.
+    /// Bumped at the start of a purge. A save that finds this moved takes its own write back out,
+    /// since after a purge the write is an orphan, and leaves the cleared memos alone.
     var purgeGeneration: [DocumentId: Int] = [:]
     let _storage: any StorageProvider
     var latestHeads: [DocumentId: Set<ChangeHash>]
@@ -65,7 +63,6 @@ final class DocumentStorage {
     /// starts from nothing rather than from heads and chunks that no longer exist.
     public func purgeDoc(id: DocumentId) async throws {
         // Before the first suspension, so any save already in flight sees the change when it resumes.
-        chunkGeneration[id, default: 0] += 1
         purgeGeneration[id, default: 0] += 1
         // Load the chunk list first: a provider's `remove` only covers the base snapshot, and a
         // document saved since its last compaction may exist only as chunks.
@@ -205,7 +202,7 @@ final class DocumentStorage {
         // Before the first suspension: an incremental save already in flight would otherwise set the
         // saved heads back behind the snapshot's once it lands.
         chunkGeneration[id, default: 0] += 1
-        let generation = chunkGeneration[id, default: 0]
+        // compactions do not overlap (`compacting`), so only a purge can replace the set under this one
         let purges = purgeGeneration[id, default: 0]
         let providedData = doc.save()
         var combined: Data = if let baseData = try await _storage.load(id: id) {
@@ -268,7 +265,8 @@ final class DocumentStorage {
             .reduce(0) { incrSize, data in
                 incrSize + data.count
             }
-        if chunkGeneration[id, default: 0] == generation {
+        // a purge during the cleanup above has cleared the memos; do not set one back
+        if purgeGeneration[id, default: 0] == purges {
             storedChunkSize[id] = remainingChunkSize
         }
     }
