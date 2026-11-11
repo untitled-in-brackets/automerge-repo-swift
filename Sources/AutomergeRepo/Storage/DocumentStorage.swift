@@ -10,6 +10,14 @@ internal import Foundation
 final class DocumentStorage {
     let chunkNamespace = "incrChanges"
     var compacting: Bool
+    /// Bumped at the start of a compaction. A save that began before it and finished after it
+    /// compares this to the value it captured and, when they differ, leaves the heads memo to the
+    /// compaction: its chunk is redundant but stays, so that a compaction whose snapshot write then
+    /// fails has not cost the changes their only copy on disk. Upstream's `#chunkGenerations`.
+    var chunkGeneration: [DocumentId: Int] = [:]
+    /// Bumped at the start of a purge. A save that finds this moved takes its own write back out,
+    /// since after a purge the write is an orphan, and leaves the cleared memos alone.
+    var purgeGeneration: [DocumentId: Int] = [:]
     let _storage: any StorageProvider
     var latestHeads: [DocumentId: Set<ChangeHash>]
 
@@ -48,10 +56,26 @@ final class DocumentStorage {
         _storage.id
     }
 
-    /// Removes a document from persistent storage.
+    /// Removes a document from persistent storage: its base snapshot and every incremental chunk.
     /// - Parameter id: The id of the document to remove.
+    ///
+    /// Forgets what this instance remembered about the document as well, so a later load or save
+    /// starts from nothing rather than from heads and chunks that no longer exist.
     public func purgeDoc(id: DocumentId) async throws {
+        // Before the first suspension, so any save already in flight sees the change when it resumes.
+        purgeGeneration[id, default: 0] += 1
+        // Load the chunk list first: a provider's `remove` only covers the base snapshot, and a
+        // document saved since its last compaction may exist only as chunks.
+        let storageChunks = try await _storage.loadRange(id: id, prefix: chunkNamespace)
         try await _storage.remove(id: id)
+        if !storageChunks.isEmpty {
+            try await _storage.removeRange(id: id, prefix: chunkNamespace, data: storageChunks)
+        }
+        chunks.removeValue(forKey: id)
+        latestHeads.removeValue(forKey: id)
+        storedChunkSize.removeValue(forKey: id)
+        memoryChunkSize.removeValue(forKey: id)
+        storedDocSize.removeValue(forKey: id)
     }
 
     /// Returns an existing document, or nil, for the document Id you provide.
@@ -98,7 +122,12 @@ final class DocumentStorage {
         }
         storedChunkSize[id] = storedChunks
         let combinedDoc = try Document(combined, logLevel: documentLogLevel)
-        latestHeads[id] = combinedDoc.heads()
+        // `latestHeads` records what is known to be on disk. A load that races a save in flight can
+        // see fewer chunks than the save has recorded, so never move the heads backwards here; the
+        // save paths own that value once it exists. An extra chunk is harmless, a skipped save is not.
+        if latestHeads[id] == nil {
+            latestHeads[id] = combinedDoc.heads()
+        }
 
         return combinedDoc
     }
@@ -168,6 +197,13 @@ final class DocumentStorage {
     ///   - doc: The document to compact.
     public func compact(id: DocumentId, doc: Document) async throws {
         compacting = true
+        // A storage error below must not leave compaction switched off for the rest of the process.
+        defer { compacting = false }
+        // Before the first suspension: an incremental save already in flight would otherwise set the
+        // saved heads back behind the snapshot's once it lands.
+        chunkGeneration[id, default: 0] += 1
+        // compactions do not overlap (`compacting`), so only a purge can replace the set under this one
+        let purges = purgeGeneration[id, default: 0]
         let providedData = doc.save()
         var combined: Data = if let baseData = try await _storage.load(id: id) {
             // loading all the changes from the base document and any incremental saves available
@@ -196,6 +232,12 @@ final class DocumentStorage {
         let compactedData = compactedDoc.save()
         // only remove the chunks AFTER the save is complete
         try await _storage.save(id: id, data: compactedData)
+        if purgeGeneration[id, default: 0] != purges {
+            // The document was purged while the snapshot was being written. The purge could not have
+            // seen the snapshot, so take it back out and leave the cleared memos alone.
+            try await _storage.remove(id: id)
+            return
+        }
         storedDocSize[id] = compactedData.count
         latestHeads[id] = compactedDoc.heads()
 
@@ -219,12 +261,14 @@ final class DocumentStorage {
         // end up with the same document, so these can safely be removed _after_ the new
         // compacted document has been stored away by the underlying storage provider.
         try await _storage.removeRange(id: id, prefix: chunkNamespace, data: storageChunks)
-        storedChunkSize[id] = try await _storage.loadRange(id: id, prefix: chunkNamespace)
+        let remainingChunkSize = try await _storage.loadRange(id: id, prefix: chunkNamespace)
             .reduce(0) { incrSize, data in
                 incrSize + data.count
             }
-
-        compacting = false
+        // a purge during the cleanup above has cleared the memos; do not set one back
+        if purgeGeneration[id, default: 0] == purges {
+            storedChunkSize[id] = remainingChunkSize
+        }
     }
 
     /// Save incremental changes of the existing Automerge document.
@@ -238,10 +282,30 @@ final class DocumentStorage {
         // document: a commit that lands during the write is not in this chunk, and reading the
         // heads afterwards would record it as stored, so the next save would skip it.
         let savedHeads = doc.heads()
+        let generation = chunkGeneration[id, default: 0]
+        let purges = purgeGeneration[id, default: 0]
         let incrementalChanges = try doc.encodeChangesSince(heads: oldHeads)
         chunkCollection.append(incrementalChanges)
         chunks[id] = chunkCollection
         try await _storage.addToRange(id: id, prefix: chunkNamespace, data: incrementalChanges)
+        if purgeGeneration[id, default: 0] != purges {
+            // The document was purged while this chunk was being written. The chunk is an orphan that
+            // cannot load without the purged base, and recording heads for a document that no longer
+            // exists would make one restored under this id look already saved. Take it back out.
+            try await _storage.removeRange(id: id, prefix: chunkNamespace, data: [incrementalChanges])
+            if var remaining = chunks[id], let index = remaining.firstIndex(of: incrementalChanges) {
+                remaining.remove(at: index)
+                chunks[id] = remaining
+            }
+            return
+        }
+        if chunkGeneration[id, default: 0] != generation {
+            // A compaction ran while this chunk was being written. Its snapshot holds the chunk's
+            // changes, so the chunk is redundant until the next compaction folds it in, and the heads
+            // it would record are behind the snapshot's. Leave the chunk on disk, where it is the
+            // changes' only copy should the snapshot's write have failed, and leave the heads alone.
+            return
+        }
         latestHeads[id] = savedHeads
     }
 

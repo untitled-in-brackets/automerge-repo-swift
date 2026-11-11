@@ -78,6 +78,27 @@ final class BaseRepoTests: XCTestCase {
         } catch {}
     }
 
+    func testDeletedDocumentDoesNotComeBackOnRelaunch() async throws {
+        let storage = InMemoryStorage()
+        let repo = Repo(sharePolicy: SharePolicy.agreeable, storage: storage)
+        let handle = try await repo.import(handle: RepoHelpers.docHandleWithData())
+        // the first save of a document is incremental, so this document exists only as chunks
+        let base = await storage.load(id: handle.id)
+        let chunks = await storage.loadRange(id: handle.id, prefix: "incrChanges")
+        XCTAssertNil(base)
+        XCTAssertFalse(chunks.isEmpty)
+
+        try await repo.delete(id: handle.id)
+
+        // "next launch": a new repo over the same storage must not see the deleted document.
+        // No peers and no fetch iterations, so find answers from storage alone.
+        let relaunched = Repo(sharePolicy: SharePolicy.agreeable, storage: storage, maxResolveFetchIterations: 0)
+        do {
+            let found = try await relaunched.find(id: handle.id)
+            XCTFail("a deleted document stored only as chunks came back: \(found.id)")
+        } catch is Errors.Unavailable {}
+    }
+
     func testClone() async throws {
         let myId = DocumentId()
         let handle = try await repo.create(id: myId)
