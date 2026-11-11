@@ -14,6 +14,8 @@ public final class Repo {
 
     private var handles: [DocumentId: InternalDocHandle] = [:]
     private var observerHandles: [DocumentId: AnyCancellable] = [:]
+    /// Documents with a sync pass scheduled but not yet run; a burst of edits produces one pass.
+    private var syncScheduled: Set<DocumentId> = []
     private var storage: DocumentStorage?
     private var network: NetworkSubsystem
 
@@ -42,7 +44,9 @@ public final class Repo {
 
     private let maxRetriesForFetch: Int
     private let pendingRequestWaitDuration: Duration
-    private var pendingRequestReadAttempts: [DocumentId: Int] = [:]
+    /// When each outstanding remote request gives up. One deadline per document, so several callers
+    /// waiting on the same document share it instead of each shortening the other's wait.
+    private var requestDeadlines: [DocumentId: ContinuousClock.Instant] = [:]
 
     private var remoteHeadsGossipingEnabled = false
 
@@ -282,15 +286,19 @@ public final class Repo {
         saveSignalHandler = saveSignalPublisher
             .debounce(for: saveDebounceDelay, scheduler: RunLoop.main)
             .sink(receiveValue: { [weak self] id in
-                guard let self,
-                      let storage = self.storage,
-                      let docHandle = self.handles[id],
-                      let docFromHandle = docHandle.doc
-                else {
-                    return
-                }
-                Task {
-                    try await storage.saveDoc(id: id, doc: docFromHandle)
+                // Combine delivers this on the main run loop, not on the repo's actor. Hop before
+                // touching any repo state.
+                Task { @AutomergeRepo [weak self] in
+                    guard let self, let storage = self.storage, let doc = self.handles[id]?.doc else {
+                        return
+                    }
+                    do {
+                        try await storage.saveDoc(id: id, doc: doc)
+                    } catch {
+                        Logger.repo.warning(
+                            "REPO: Error saving document \(id): \(error.localizedDescription, privacy: .public)"
+                        )
+                    }
                 }
             })
     }
@@ -350,29 +358,34 @@ public final class Repo {
         }
     }
 
+    /// Offers `docId` to `peer` if the share policy allows and the document is in hand.
+    ///
+    /// A document still loading from storage or being requested from peers is not offered: waiting on
+    /// it here would hold up whatever called this, which for a new connection is every other document
+    /// and the provider's own event delivery. ``updateDoc`` offers such a document to every peer once
+    /// it arrives.
     func beginSync(docId: DocumentId, to peer: PEER_ID) async {
         if await sharePolicy.share(peer: peer, docId: docId) {
+            // the share policy may have suspended; read the handle only now
+            guard let handle = handles[docId], let doc = handle.doc, handle.state == .ready else {
+                if logLevel(.repo).canTrace() {
+                    Logger.repo.trace("REPO: \(self.peerId) not offering \(docId) to \(peer), document not in hand")
+                }
+                return
+            }
             if logLevel(.repo).canTrace() {
                 Logger.repo.trace("REPO: \(self.peerId) starting a sync for document \(docId) to \(peer)")
             }
-            do {
-                let handle = try await resolveDocHandle(id: docId)
-                let syncState = syncState(id: docId, peer: peer)
-                if let syncData = handle.doc.generateSyncMessage(state: syncState) {
-                    let syncMsg: SyncV1Msg = .sync(.init(
-                        documentId: docId.description,
-                        senderId: peerId,
-                        targetId: peer,
-                        sync_message: syncData
-                    ))
-                    syncRequestPublisher.send(SyncRequest(id: docId, peer: peer))
-                    await network.send(message: syncMsg, to: peer)
-                }
-            } catch {
-                Logger.repo
-                    .error(
-                        "REPO: \(self.peerId) Failed to generate sync on peer connection: \(error.localizedDescription, privacy: .public)"
-                    )
+            let syncState = syncState(id: docId, peer: peer)
+            if let syncData = doc.generateSyncMessage(state: syncState) {
+                let syncMsg: SyncV1Msg = .sync(.init(
+                    documentId: docId.description,
+                    senderId: peerId,
+                    targetId: peer,
+                    sync_message: syncData
+                ))
+                syncRequestPublisher.send(SyncRequest(id: docId, peer: peer))
+                await network.send(message: syncMsg, to: peer)
             }
         } else {
             if logLevel(.repo).canTrace() {
@@ -417,15 +430,32 @@ public final class Repo {
             return
         }
         if let doc = handle.doc, handle.state == .ready, observerHandles[id] == nil {
-            // sync changes should be invoked as rapidly as possible to allow for best possible
-            // collaborative editing experiences.
+            // `objectWillChange` fires synchronously on whichever thread is mutating the document,
+            // which is the app's, not this actor's. The compiler infers this closure as actor-isolated
+            // and would let it read repo state directly; it must only hop.
             let handleObserver = doc.objectWillChange
                 .sink { [weak self] _ in
-                    guard let self else { return }
-                    self.saveSignalPublisher.send(id)
-                    syncToAllPeers(id: id)
+                    Task { @AutomergeRepo [weak self] in
+                        self?.documentDidChange(id: id)
+                    }
                 }
             observerHandles[id] = handleObserver
+        }
+    }
+
+    /// Reacts to a local edit of `id`: signals the debounced save and schedules one sync pass.
+    ///
+    /// Edits arrive one `objectWillChange` at a time, so a burst of them would otherwise start a sync
+    /// pass each. The first schedules a pass and later ones in the same burst do nothing; the pass
+    /// generates from the live document, so it carries every edit made before it runs.
+    private func documentDidChange(id: DocumentId) {
+        saveSignalPublisher.send(id)
+        guard !syncScheduled.contains(id) else { return }
+        syncScheduled.insert(id)
+        Task { @AutomergeRepo in
+            await Task.yield()
+            syncScheduled.remove(id)
+            syncToAllPeers(id: id)
         }
     }
 
@@ -533,16 +563,32 @@ public final class Repo {
         if let internalHandle = handles[docId], internalHandle.state != .deleted {
             // If we have the document, see if we're agreeable to sending a copy
             if await sharePolicy.share(peer: msg.senderId, docId: docId) {
+                // Answer from what is in hand. A document still being requested from peers is not ours
+                // to give: say so now rather than wait for it here, which would block this adapter's
+                // event delivery, and offer it through `updateDoc` if it arrives. samod does the same.
+                guard let handle = handles[docId], handle.doc != nil,
+                      ![.deleted, .requesting, .unavailable].contains(handle.state)
+                else {
+                    let nope = SyncV1Msg.UnavailableMsg(
+                        documentId: msg.documentId,
+                        senderId: peerId,
+                        targetId: msg.senderId
+                    )
+                    await network.send(message: .unavailable(nope), to: msg.senderId)
+                    return
+                }
                 do {
-                    let handle = try await resolveDocHandle(id: docId)
+                    // a document in hand resolves without waiting on peers
+                    let resolved = try await resolveDocHandle(id: docId)
+                    let doc = resolved.doc
                     let syncState = syncState(id: docId, peer: msg.senderId)
                     // Apply the request message as a sync update
-                    let patches = try handle.doc.receiveSyncMessageWithPatches(state: syncState, message: msg.data)
+                    let patches = try doc.receiveSyncMessageWithPatches(state: syncState, message: msg.data)
                     // Stash the sync state, then the document (which publishes any change before saving)
                     await updateSyncState(id: docId, peer: msg.senderId, syncState: syncState)
-                    await updateDoc(id: docId, doc: handle.doc, applied: patches, from: .sync(peer: msg.senderId))
+                    await updateDoc(id: docId, doc: doc, applied: patches, from: .sync(peer: msg.senderId))
                     // Attempt to generate a sync message to reply
-                    if let syncData = handle.doc.generateSyncMessage(state: syncState) {
+                    if let syncData = doc.generateSyncMessage(state: syncState) {
                         let syncMsg: SyncV1Msg = .sync(.init(
                             documentId: docId.description,
                             senderId: peerId,
@@ -634,18 +680,10 @@ public final class Repo {
     @discardableResult
     public func `import`(handle: DocHandle) async throws -> DocHandle {
         if let existingHandle = handles[handle.id] {
-            if [.loading, .requesting].contains(existingHandle.state) {
-                // The state of the internal handle is in .requesting or .loading, meaning those
-                // processes are in place, or were in place and aborted. To resolve any potential
-                // concurrency issues, we'll resolve to a known state that we can handle and continue
-                // with merging from there.
-                do {
-                    let _ = try await resolveDocHandle(id: existingHandle.id)
-                } catch {
-                    // intentionally catch errors to indicate that the state is resolved
-                    // so that we can continue
-                }
-            }
+            // A handle that is `.loading` or `.requesting` has a `find` in flight. Do not wait on it: a
+            // request to peers can take the whole fetch timeout. Merging into (or supplying) the document
+            // here and marking the handle ready is what that `find` is waiting for, and a storage load
+            // that returns afterwards merges its copy in rather than replacing this one.
             // verify that the document exists on the handle, and if so, merge
             let mergedDoc: Document
             var mergePatches: [Patch] = []
@@ -865,7 +903,12 @@ public final class Repo {
                 Logger.repo.trace("REPO: No stored sync state for doc \(id) and peer \(peer).")
                 Logger.repo.trace("REPO: Creating a new sync state for doc \(id)")
             }
-            return SyncState()
+            // Store it before handing it out: there is one sync state per (document, peer) from first
+            // use, as the JS and Rust ports keep it on the peer connection. Callers that only generate a
+            // message, like beginSync, otherwise worked from a throwaway state the reply never matched.
+            let fresh = SyncState()
+            handle.syncStates[peer] = fresh
+            return fresh
         }
     }
 
@@ -918,13 +961,22 @@ public final class Repo {
         }
         // Automerge-repo https://github.com/automerge/automerge-repo/issues/343 is sending two responses,
         // the first being UNAVAILABLE, which we use to change the state, but that triggers this unexpected
-        // assertion, we we later receive the SYNC update to set the document as expected
-        assert(handle.state == .ready || handle.state == .unavailable || handle.state == .requesting)
+        // assertion, we we later receive the SYNC update to set the document as expected. A sync can also
+        // land while the handle is `.loading`, between `find` starting a storage load and it returning.
+        assert([.ready, .unavailable, .requesting, .loading].contains(handle.state))
+        let wasReady = handle.state == .ready
         handle.doc = doc
         handle.state = .ready
         docHandlePublisher.send(handle.snapshot())
         if let source {
             publishChange(id: id, patches: patches, doc: doc, source: source)
+        }
+        if !wasReady {
+            // The document has just arrived. Peers that asked for it while it was still being requested
+            // were told it was unavailable, and a peer that connected meanwhile was not offered it; both
+            // get it now, through the share policy, the way any other document would be.
+            watchDocForChanges(id: id)
+            syncToAllPeers(id: id)
         }
         if let storage {
             do {
@@ -1051,8 +1103,18 @@ public final class Repo {
                     // to load it from storage, and failing that - if the storage provider
                     // doesn't exist, for example - jump forward to attempting to fetch
                     // it from a peer.
-                    if let doc = try await loadFromStorage(id: id) {
-                        handle.doc = doc
+                    let stored = try await loadFromStorage(id: id)
+                    // The load suspended this actor. A sync from a peer, or an import, may have given the
+                    // handle a document meanwhile; the storage copy folds into that rather than replacing it.
+                    if handle.state == .deleted {
+                        return try await resolveDocHandle(id: id)
+                    }
+                    if let stored {
+                        if let current = handle.doc {
+                            try current.merge(other: stored)
+                        } else {
+                            handle.doc = stored
+                        }
                         handle.state = .ready
                         if loglevel.canTrace() {
                             Logger.resolver.trace("RESOLVE: :: loaded \(id) from storage provider")
@@ -1063,9 +1125,14 @@ public final class Repo {
                         }
                         docHandlePublisher.send(handle.snapshot())
                         return try await resolveDocHandle(id: id)
+                    } else if handle.doc != nil {
+                        // nothing in storage, but a peer or an import supplied the document during the load
+                        handle.state = .ready
+                        docHandlePublisher.send(handle.snapshot())
+                        return try await resolveDocHandle(id: id)
                     } else {
                         handle.state = .requesting
-                        pendingRequestReadAttempts[id] = 0
+                        requestDeadlines[id] = .now + pendingRequestWaitDuration * maxRetriesForFetch
                         if loglevel.canTrace() {
                             Logger.resolver.trace("RESOLVE: :: \(id) -> [\(String(describing: handle.state))]")
                             Logger.resolver.trace("RESOLVE: :: starting remote fetch")
@@ -1083,42 +1150,39 @@ public final class Repo {
                     Logger.resolver.error("RESOLVE: :: Missing \(id) -> [UNAVAILABLE]")
                     throw Errors.Unavailable(id: handle.id)
                 }
-                if updatedHandle.doc != nil, updatedHandle.state == .ready {
-                    // this may not be needed... but i'm being paranoid about when the change happens
-                    // due to re-entrancy and all the awaits in this method
+                if updatedHandle.state != .requesting {
+                    // a peer answered, an import supplied it, or it was deleted while we slept
+                    requestDeadlines.removeValue(forKey: id)
                     return try await resolveDocHandle(id: id)
-                } else {
-                    guard let previousRequests = pendingRequestReadAttempts[id] else {
-                        Logger.resolver
-                            .error("RESOLVE: :: Missing \(id) from pending request read attempts -> [UNAVAILABLE]")
-                        throw Errors.Unavailable(id: id)
-                    }
-                    if previousRequests < maxRetriesForFetch {
-                        // we are racing against the receipt of a network result
-                        // to see what we get at the end
-                        if loglevel.canTrace() {
-                            Logger.resolver.trace("RESOLVE: :: \(id) -> [\(String(describing: handle.state))]")
-                            Logger.resolver
-                                .trace(
-                                    "RESOLVE: :: check # \(previousRequests) (of \(self.maxRetriesForFetch), waiting \(self.pendingRequestWaitDuration) seconds for remote fetch"
-                                )
-                        }
-                        try await Task.sleep(for: pendingRequestWaitDuration)
-                        pendingRequestReadAttempts[id] = previousRequests + 1
-                        if loglevel.canTrace() {
-                            Logger.resolver.trace("RESOLVE: :: continuing to resolve")
-                        }
-                        return try await resolveDocHandle(id: id)
-                    } else {
-                        updatedHandle.state = .unavailable
-                        docHandlePublisher.send(handle.snapshot())
-                        Logger.resolver
-                            .error(
-                                "RESOLVE: :: failed waiting \(previousRequests) of \(self.maxRetriesForFetch) requests for  \(id) -> [UNAVAILABLE]"
-                            )
-                        throw Errors.Unavailable(id: id)
-                    }
                 }
+                guard let deadline = requestDeadlines[id] else {
+                    Logger.resolver.error("RESOLVE: :: Missing \(id) from pending request deadlines -> [UNAVAILABLE]")
+                    throw Errors.Unavailable(id: id)
+                }
+                if ContinuousClock.now < deadline {
+                    // we are racing against the receipt of a network result; every caller waiting on this
+                    // document sleeps against the same deadline
+                    if loglevel.canTrace() {
+                        Logger.resolver.trace("RESOLVE: :: \(id) -> [\(String(describing: handle.state))]")
+                        Logger.resolver
+                            .trace(
+                                "RESOLVE: :: waiting \(self.pendingRequestWaitDuration) for remote fetch, \(deadline - .now) until giving up"
+                            )
+                    }
+                    try await Task.sleep(for: pendingRequestWaitDuration)
+                    if loglevel.canTrace() {
+                        Logger.resolver.trace("RESOLVE: :: continuing to resolve")
+                    }
+                    return try await resolveDocHandle(id: id)
+                }
+                requestDeadlines.removeValue(forKey: id)
+                updatedHandle.state = .unavailable
+                docHandlePublisher.send(handle.snapshot())
+                Logger.resolver
+                    .error(
+                        "RESOLVE: :: gave up waiting \(self.pendingRequestWaitDuration * self.maxRetriesForFetch) for \(id) -> [UNAVAILABLE]"
+                    )
+                throw Errors.Unavailable(id: id)
             case .ready:
                 guard let doc = handle.doc else { fatalError("DocHandle state is ready, but ._doc is null") }
                 if loglevel.canTrace() {
