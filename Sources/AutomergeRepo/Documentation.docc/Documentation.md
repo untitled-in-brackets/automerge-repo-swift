@@ -25,10 +25,11 @@ The peer-to-peer provider uses of Apple's Bonjour technology to connect to other
 
 ### Following changes the repository applies
 
-The repository publishes a ``DocumentChange`` for every change it applies to a document from a peer or a merge, through ``Repo/documentChangePublisher`` or, per document, ``Repo/documentChanges(for:)``.
+The repository publishes a ``DocumentChange`` for every change it applies to a document from a peer or a merge, as a per-document stream from ``Repo/documentChanges(for:)``.
 Each change carries the patches that application produced, the document's heads afterwards, and which peer it came from.
 Writes made directly to a handle's document are not published, because the caller made them.
-Events are sent from the repository's actor; move to your own isolation before touching your state.
+A change is published once it is applied to the in-memory document, before the repository saves it to the storage provider; call ``Repo/savePendingChanges(id:)`` when you need a change on disk.
+Events are yielded from the repository's actor; move to your own isolation before touching your state.
 
 ## Topics
 

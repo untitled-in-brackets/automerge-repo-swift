@@ -251,6 +251,7 @@ final class DocumentChangeEventTests: XCTestCase {
         )
         let adapterB = await network.createNetworkEndpoint(config: .init(listeningNetwork: true, name: "B2"))
         await repoB.addNetworkAdapter(adapter: adapterB)
+        let changesOnA = ChangeCollector(repoA)
         let changesOnB = ChangeCollector(repoB)
 
         let handleA = try await repoA.create()
@@ -280,6 +281,8 @@ final class DocumentChangeEventTests: XCTestCase {
         XCTAssertEqual(fill.heads, found.doc.heads())
         let recorded = await headsSeenInSink.waitForValue()
         XCTAssertEqual(recorded, fill.heads, "a find inside the sink sees a ready handle at the event's heads")
+        // A answered through handleRequest; the request carried nothing new for A, so A publishes nothing
+        XCTAssertTrue(changesOnA.changes.isEmpty, "\(changesOnA.changes)")
     }
 
     func testDocumentChangesStreamYieldsOnlyItsDocument() async throws {
@@ -315,6 +318,185 @@ final class DocumentChangeEventTests: XCTestCase {
             XCTAssertEqual(change.id, first.id)
             XCTAssertEqual(change.patches.rootKeysPut, ["one"])
         }
+    }
+
+    // MARK: Ordering against storage
+
+    /// A remote peer's document and sync state, driven by hand so a test can feed the repo exactly the
+    /// messages it wants, when it wants.
+    private struct HandDrivenPeer {
+        let peerId: PEER_ID = "hand-driven-peer"
+        let doc = Document()
+        let state = SyncState()
+
+        /// Exchanges one round with `local` so later messages from this peer carry changes, not just heads.
+        func handshake(with local: Document) throws {
+            let localState = SyncState()
+            let hello = try XCTUnwrap(doc.generateSyncMessage(state: state))
+            try local.receiveSyncMessage(state: localState, message: hello)
+            let reply = try XCTUnwrap(local.generateSyncMessage(state: localState))
+            try doc.receiveSyncMessage(state: state, message: reply)
+        }
+
+        /// Commits a put at the root and returns the sync message carrying it, addressed to `repo`.
+        func commit(key: String, value: String, for repo: Repo, id: DocumentId) throws -> SyncV1Msg.SyncMsg {
+            try doc.put(obj: .ROOT, key: key, value: .String(value))
+            doc.commitWith(message: key)
+            let data = try XCTUnwrap(doc.generateSyncMessage(state: state))
+            return .init(documentId: id.description, senderId: peerId, targetId: repo.peerId, sync_message: data)
+        }
+    }
+
+    func testEventsPublishInApplicationOrderWhenSavesFinishOutOfOrder() async throws {
+        let storage = ControllableStorage()
+        let repo = Repo(sharePolicy: SharePolicy.agreeable, storage: storage)
+        let changes = ChangeCollector(repo)
+        let local = try await repo.create()
+        let peer = HandDrivenPeer()
+        try peer.handshake(with: local.doc)
+        let first = try peer.commit(key: "first", value: "1", for: repo, id: local.id)
+        let second = try peer.commit(key: "second", value: "2", for: repo, id: local.id)
+
+        // the first application's save is slow, the second's immediate
+        await storage.queueWriteDelays([.milliseconds(300), .zero])
+        let applyFirst = Task { await repo.handleSync(msg: first) }
+        try await Task.sleep(for: .milliseconds(50)) // first is now suspended in its save
+        await repo.handleSync(msg: second)
+        await applyFirst.value
+
+        let events = changes.changes
+        XCTAssertEqual(
+            events.map(\.patches.rootKeysPut), [["first"], ["second"]],
+            "events must follow application order"
+        )
+        XCTAssertEqual(events.last?.heads, local.doc.heads())
+        XCTAssertNotEqual(
+            events.first?.heads, events.last?.heads,
+            "each event's heads are read right after its own application"
+        )
+        for event in events {
+            XCTAssertEqual(event.source, .sync(peer: peer.peerId))
+        }
+    }
+
+    func testImportsPublishInApplicationOrderWhenSavesFinishOutOfOrder() async throws {
+        let storage = ControllableStorage()
+        let repo = Repo(sharePolicy: SharePolicy.agreeable, storage: storage)
+        let changes = ChangeCollector(repo)
+        let base = try await repo.create()
+        let ahead = try Document(base.doc.save())
+        try ahead.put(obj: .ROOT, key: "one", value: .String("1"))
+        ahead.commitWith()
+        let further = try Document(ahead.save())
+        try further.put(obj: .ROOT, key: "two", value: .String("2"))
+        further.commitWith()
+
+        await storage.queueWriteDelays([.milliseconds(300), .zero])
+        let importFirst = Task { try await repo.import(handle: DocHandle(id: base.id, doc: ahead)) }
+        try await Task.sleep(for: .milliseconds(50))
+        try await repo.import(handle: DocHandle(id: base.id, doc: further))
+        _ = try await importFirst.value
+
+        let events = changes.changes
+        XCTAssertEqual(events.map(\.patches.rootKeysPut), [["one"], ["two"]])
+        XCTAssertEqual(events.map(\.source), [.merge, .merge])
+        XCTAssertEqual(events.last?.heads, base.doc.heads())
+    }
+
+    func testEventIsPublishedEvenWhenTheSaveFails() async throws {
+        let storage = ControllableStorage()
+        let repo = Repo(sharePolicy: SharePolicy.agreeable, storage: storage)
+        let changes = ChangeCollector(repo)
+        let local = try await repo.create()
+        let peer = HandDrivenPeer()
+        try peer.handshake(with: local.doc)
+        let msg = try peer.commit(key: "title", value: "unsaved", for: repo, id: local.id)
+
+        await storage.setWritesFail(true)
+        await repo.handleSync(msg: msg)
+
+        let events = changes.changes
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events.first?.patches.rootKeysPut, ["title"])
+        XCTAssertEqual(events.first?.heads, local.doc.heads(), "the in-memory document has the change regardless")
+        let found = try await repo.findLocal(id: local.id)
+        XCTAssertTrue(try XCTUnwrap(found).doc === local.doc)
+    }
+
+    func testEventIsPublishedAfterTheHandleIsReadyWithStorage() async throws {
+        let storage = ControllableStorage()
+        let repo = Repo(sharePolicy: SharePolicy.agreeable, storage: storage)
+        let changes = ChangeCollector(repo)
+        let local = try await repo.create()
+        let peer = HandDrivenPeer()
+        try peer.handshake(with: local.doc)
+        let msg = try peer.commit(key: "title", value: "seen", for: repo, id: local.id)
+
+        let headsSeenInSink = HeadsBox()
+        changes.onChange = { change in
+            Task { @AutomergeRepo in
+                if let handle = try? await repo.findLocal(id: change.id) {
+                    headsSeenInSink.record(handle.doc.heads())
+                }
+            }
+        }
+        await storage.queueWriteDelays([.milliseconds(200)])
+        await repo.handleSync(msg: msg)
+
+        let event = try XCTUnwrap(changes.changes.first)
+        let recorded = await headsSeenInSink.waitForValue()
+        XCTAssertEqual(recorded, event.heads, "a reader during the event sees the applied document, not the stored one")
+    }
+
+    func testSyncForADeletedDocumentEmitsNothing() async throws {
+        let handleA = try await repoA.create()
+        try await connect()
+        try await waitUntilInSync(handleA.id)
+        try await repoB.delete(id: handleA.id)
+        let before = changesOnB.changes.count
+
+        try handleA.doc.put(obj: .ROOT, key: "after", value: .String("delete"))
+        handleA.doc.commitWith()
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertEqual(changesOnB.changes.count, before, "a deleted handle ignores incoming sync")
+    }
+
+    // MARK: Stream lifecycle
+
+    func testDocumentChangesStreamDeliversEventsEmittedBeforeIterationBegins() async throws {
+        let target = try await repoA.create()
+        let other = try await repoA.create()
+        try other.doc.put(obj: .ROOT, key: "early", value: .String("yes"))
+        other.doc.commitWith()
+
+        let stream = repoA.documentChanges(for: target.id)
+        try await repoA.merge(id: target.id, with: other.id)
+
+        var iterator = stream.makeAsyncIterator()
+        let first = await iterator.next()
+        XCTAssertEqual(first?.patches.rootKeysPut, ["early"], "subscription starts when the stream is created")
+    }
+
+    func testDocumentChangesStreamFinishesWhenTheRepoDeallocates() async throws {
+        var repo: Repo? = Repo(sharePolicy: SharePolicy.agreeable)
+        let stream = try XCTUnwrap(repo).documentChanges(for: DocumentId())
+        repo = nil
+
+        let finished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await _ in stream {}
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(2))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        XCTAssertTrue(finished, "the stream should finish instead of waiting forever on a dead repo")
     }
 
     func testEventHeadsIncludeALocalTransactionThatHeldTheLock() async throws {

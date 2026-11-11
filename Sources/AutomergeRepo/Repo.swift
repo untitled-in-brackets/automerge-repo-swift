@@ -1,6 +1,6 @@
 public import Automerge
 internal import AutomergeUtilities
-@preconcurrency public import Combine
+@preconcurrency internal import Combine
 public import Foundation
 internal import OSLog
 
@@ -66,20 +66,34 @@ public final class Repo {
         PassthroughSubject()
 
     /// Changes the repo applies to documents from peers and merges, in the order they are applied.
-    ///
-    /// Writes made directly to a handle's document are not published; the caller made those. Values are
-    /// sent from the repo's actor, after the document and its handle have been updated; hop to your own
-    /// isolation before touching your state. See ``documentChanges(for:)`` for a per-document stream.
-    public nonisolated let documentChangePublisher: PassthroughSubject<DocumentChange, Never> =
+    /// The public surface is ``documentChanges(for:)``.
+    nonisolated let documentChangePublisher: PassthroughSubject<DocumentChange, Never> =
         PassthroughSubject()
 
-    /// ``documentChangePublisher`` filtered to `id`, as a stream.
+    deinit {
+        // Combine subjects do not complete their subscribers when they deallocate; without this, a
+        // `documentChanges(for:)` stream on a dead repo would wait forever.
+        documentChangePublisher.send(completion: .finished)
+        docHandlePublisher.send(completion: .finished)
+        syncRequestPublisher.send(completion: .finished)
+        saveSignalPublisher.send(completion: .finished)
+    }
+
+    /// The changes the repo applies to `id` from peers and merges, in the order they are applied.
     /// - Parameter id: The document to follow.
-    /// - Returns: A stream that yields each change the repo applies to `id` from a peer or a merge, and
-    /// finishes when the repo deallocates.
+    /// - Returns: A stream of ``DocumentChange`` that finishes when the repo deallocates.
+    ///
+    /// Writes made directly to a handle's document are not reported; the caller made those. A change is
+    /// reported once it is applied to the in-memory document and the handle is ready, so ``find(id:)`` or
+    /// ``findLocal(id:)`` during the event returns a document at the event's heads. The save to the storage
+    /// provider follows; use ``savePendingChanges(id:)`` when you need the change on disk.
+    ///
+    /// Events are yielded from the repo's actor and buffered until read; hop to your own isolation before
+    /// touching your state.
     public nonisolated func documentChanges(for id: DocumentId) -> AsyncStream<DocumentChange> {
-        AsyncStream { continuation in
-            let subscription = documentChangePublisher
+        let publisher = documentChangePublisher
+        return AsyncStream { continuation in
+            let subscription = publisher
                 .filter { $0.id == id }
                 .sink(
                     receiveCompletion: { _ in continuation.finish() },
@@ -472,11 +486,10 @@ public final class Repo {
             let syncState = syncState(id: docId, peer: msg.senderId)
             // Apply the request message as a sync update
             let patches = try docFromHandle.receiveSyncMessageWithPatches(state: syncState, message: msg.data)
-            // Stash the updated document and sync state
-            await updateDoc(id: docId, doc: docFromHandle)
+            // Stash the sync state, then the document: updateDoc publishes the change once the handle is
+            // ready and before it suspends on the save, so a consumer can find the document during the event
             await updateSyncState(id: docId, peer: msg.senderId, syncState: syncState)
-            // the handle is .ready and the save queued, so a consumer can find the document during the event
-            publishChange(id: docId, patches: patches, doc: docFromHandle, source: .sync(peer: msg.senderId))
+            await updateDoc(id: docId, doc: docFromHandle, applied: patches, from: .sync(peer: msg.senderId))
             // Attempt to generate a sync message to reply
 
             // DEBUG ONLY
@@ -525,10 +538,9 @@ public final class Repo {
                     let syncState = syncState(id: docId, peer: msg.senderId)
                     // Apply the request message as a sync update
                     let patches = try handle.doc.receiveSyncMessageWithPatches(state: syncState, message: msg.data)
-                    // Stash the updated doc and sync state
-                    await updateDoc(id: docId, doc: handle.doc)
+                    // Stash the sync state, then the document (which publishes any change before saving)
                     await updateSyncState(id: docId, peer: msg.senderId, syncState: syncState)
-                    publishChange(id: docId, patches: patches, doc: handle.doc, source: .sync(peer: msg.senderId))
+                    await updateDoc(id: docId, doc: handle.doc, applied: patches, from: .sync(peer: msg.senderId))
                     // Attempt to generate a sync message to reply
                     if let syncData = handle.doc.generateSyncMessage(state: syncState) {
                         let syncMsg: SyncV1Msg = .sync(.init(
@@ -635,24 +647,22 @@ public final class Repo {
                 }
             }
             // verify that the document exists on the handle, and if so, merge
-            // and save it
+            let mergedDoc: Document
             var mergePatches: [Patch] = []
             if let existingDoc = existingHandle.doc {
                 mergePatches = try existingDoc.mergeWithPatches(other: handle.doc)
-                // store the document if there's a storage provider available
-                try await storage?.saveDoc(id: existingHandle.id, doc: existingDoc)
+                mergedDoc = existingDoc
             } else {
-                // if there isn't a document on the internal handle, use the document
-                // provided.
+                // if there isn't a document on the internal handle, use the document provided.
                 existingHandle.doc = handle.doc
-                // store the document if there's a storage provider available
-                try await storage?.saveDoc(id: existingHandle.id, doc: handle.doc)
+                mergedDoc = handle.doc
             }
             existingHandle.state = .ready
             docHandlePublisher.send(existingHandle.snapshot())
-            if let mergedDoc = existingHandle.doc {
-                publishChange(id: existingHandle.id, patches: mergePatches, doc: mergedDoc, source: .merge)
-            }
+            // publish before the save suspends, so changes go out in the order they were applied
+            publishChange(id: existingHandle.id, patches: mergePatches, doc: mergedDoc, source: .merge)
+            // store the document if there's a storage provider available
+            try await storage?.saveDoc(id: existingHandle.id, doc: mergedDoc)
             // calling resolveDocHandle when we've just set the state to .ready
             // is tantamount to asking for a DocHandle from the internal variation
             // but with some extra checks to make sure nothing is awry with expected state.
@@ -887,7 +897,18 @@ public final class Repo {
         docHandlePublisher.send(handle.snapshot())
     }
 
-    func updateDoc(id: DocumentId, doc: Document) async {
+    /// Stores `doc` on the handle for `id`, marks it ready, publishes the change that produced `patches` if
+    /// there were any, and then saves the document.
+    ///
+    /// The change is published before the save suspends this actor. Published afterwards, two applications
+    /// to the same document would go out in the order their saves finished rather than the order they were
+    /// applied, and a consumer applying patches incrementally needs application order.
+    func updateDoc(
+        id: DocumentId,
+        doc: Document,
+        applied patches: [Patch] = [],
+        from source: DocumentChange.Source? = nil
+    ) async {
         // handling a requested document being marked as ready after document contents received
         guard let handle = handles[id] else {
             fatalError("No stored document handle for document id: \(id)")
@@ -902,6 +923,9 @@ public final class Repo {
         handle.doc = doc
         handle.state = .ready
         docHandlePublisher.send(handle.snapshot())
+        if let source {
+            publishChange(id: id, patches: patches, doc: doc, source: source)
+        }
         if let storage {
             do {
                 try await storage.saveDoc(id: id, doc: doc)
@@ -924,24 +948,26 @@ public final class Repo {
             throw Errors.Unavailable(id: with)
         }
 
+        // Gather everything that needs loading first, so the merges below run without suspending and a sync
+        // for either document cannot land between them and be misattributed in the published change.
         let doc1 = try await resolveDocHandle(id: handle1.id)
+        let doc2 = try await resolveDocHandle(id: handle2.id)
+        let doc1Storage = try await storage?.loadDoc(id: handle1.id)
+        let doc2Storage = try await storage?.loadDoc(id: handle2.id)
+
         var patches: [Patch] = []
         // Start with updating from storage changes, if any
-        if let doc1Storage = try await storage?.loadDoc(id: handle1.id) {
+        if let doc1Storage {
             patches += try doc1.doc.mergeWithPatches(other: doc1Storage)
         }
-
         // merge in the provided second document from memory
-        let doc2 = try await resolveDocHandle(id: handle2.id)
         patches += try doc1.doc.mergeWithPatches(other: doc2.doc)
-
-        // JUST IN CASE, try and load doc2 from storage and merge that if available
-        if let doc2Storage = try await storage?.loadDoc(id: handle2.id) {
+        // JUST IN CASE, merge in doc2 from storage as well if available
+        if let doc2Storage {
             patches += try doc1.doc.mergeWithPatches(other: doc2Storage)
         }
-        // finally, update the repo
-        await updateDoc(id: doc1.id, doc: doc1.doc)
-        publishChange(id: doc1.id, patches: patches, doc: doc1.doc, source: .merge)
+        // finally, update the repo (which publishes the merge before saving)
+        await updateDoc(id: doc1.id, doc: doc1.doc, applied: patches, from: .merge)
     }
 
     private func loadFromStorage(id: DocumentId) async throws -> Document? {

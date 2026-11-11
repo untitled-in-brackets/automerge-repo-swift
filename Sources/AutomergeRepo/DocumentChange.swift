@@ -5,7 +5,8 @@ public import struct Automerge.Patch
 /// message from a peer, or a merge the repo performed.
 ///
 /// Writes made directly to a handle's document are not reported; the caller made those. The repo
-/// publishes these through ``Repo/documentChangePublisher`` and ``Repo/documentChanges(for:)``.
+/// publishes these through ``Repo/documentChanges(for:)``, once the change is applied to the in-memory
+/// document and before it is saved to the storage provider.
 ///
 /// `Patch`, `PatchAction`, `PathElement` and `DeleteSeq` in automerge-swift are not yet declared
 /// `Sendable`, although every stored property of theirs is a `Sendable` value type. The conformance
