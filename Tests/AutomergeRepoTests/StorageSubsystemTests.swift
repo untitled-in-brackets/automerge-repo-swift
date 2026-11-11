@@ -93,6 +93,36 @@ final class StorageSubsystemTests: XCTestCase {
         XCTAssertTrue(newDoc.equivalentContents(unwrappedDoc))
     }
 
+    func testCommitDuringAnIncrementalWriteIsStillSavedByTheNextSave() async throws {
+        let slowProvider = ControllableStorage()
+        let subsystem = DocumentStorage(slowProvider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let id = DocumentId()
+        let doc = Document()
+        try doc.put(obj: .ROOT, key: "first", value: .String("1"))
+        doc.commitWith()
+
+        // the first save's write is slow; a local commit lands while it is in flight
+        await slowProvider.queueWriteDelays([.milliseconds(300)])
+        let firstSave = Task { try await subsystem.saveDoc(id: id, doc: doc) }
+        try await Task.sleep(for: .milliseconds(50))
+        try doc.put(obj: .ROOT, key: "second", value: .String("2"))
+        doc.commitWith()
+        try await firstSave.value
+
+        // the second commit was not in the first chunk, so the next save must write it
+        try await subsystem.saveDoc(id: id, doc: doc)
+        let writes = await slowProvider.writeCount
+        XCTAssertEqual(writes, 2, "the second save must not be skipped as already stored")
+
+        // read back from the provider alone, bypassing this subsystem's in-memory chunks
+        let freshSubsystem = DocumentStorage(slowProvider, verbosity: .errorOnly, documentLogVerbosity: .errorOnly)
+        let loadedFromDisk = try await freshSubsystem.loadDoc(id: id)
+        let loaded = try XCTUnwrap(loadedFromDisk)
+        XCTAssertEqual(try loaded.get(obj: .ROOT, key: "first"), .Scalar(.String("1")))
+        XCTAssertEqual(try loaded.get(obj: .ROOT, key: "second"), .Scalar(.String("2")))
+        XCTAssertEqual(loaded.heads(), doc.heads())
+    }
+
     func testSubsystemPurgeDoc() async throws {
         let newDoc = try RepoHelpers.documentWithData()
         let newDocId = DocumentId()

@@ -234,11 +234,15 @@ final class DocumentStorage {
     public func saveIncremental(id: DocumentId, doc: Document) async throws {
         var chunkCollection = chunks[id] ?? []
         let oldHeads = latestHeads[id] ?? Set<ChangeHash>()
+        // Capture the heads the chunk covers before the write suspends. `doc` is a live, mutable
+        // document: a commit that lands during the write is not in this chunk, and reading the
+        // heads afterwards would record it as stored, so the next save would skip it.
+        let savedHeads = doc.heads()
         let incrementalChanges = try doc.encodeChangesSince(heads: oldHeads)
         chunkCollection.append(incrementalChanges)
         chunks[id] = chunkCollection
         try await _storage.addToRange(id: id, prefix: chunkNamespace, data: incrementalChanges)
-        latestHeads[id] = doc.heads()
+        latestHeads[id] = savedHeads
     }
 
 //    public func loadSyncState(id _: DocumentId, storageId _: SyncV1.STORAGE_ID) async -> SyncState {
