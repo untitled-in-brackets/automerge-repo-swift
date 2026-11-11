@@ -150,6 +150,8 @@ final class StorageSubsystemTests: XCTestCase {
         let first = try RepoHelpers.documentWithData()
         try await subsystem.saveDoc(id: id, doc: first)
         try await subsystem.purgeDoc(id: id)
+        let purged = try await subsystem.loadDoc(id: id)
+        XCTAssertNil(purged, "precondition: the purge removed the document")
 
         // a new document under the same id, with the same heads as the purged one: it must still be
         // written, which it would not be if the purged heads were still recorded as saved
