@@ -107,4 +107,41 @@ final class WebSocketProviderCancellationTests: XCTestCase {
         let state = await provider.state
         XCTAssertEqual(state, .disconnected)
     }
+
+    /// Disconnects the provider from inside the `.ready` event, which is when the repo, told the
+    /// handshake succeeded, has the provider suspended and a release can remove it.
+    private final class DisconnectingReceiver: NetworkEventReceiver {
+        private let provider: WebSocketProvider
+        init(provider: WebSocketProvider) { self.provider = provider }
+        func receiveEvent(event: NetworkAdapterEvents) async {
+            if case .ready = event {
+                await provider.disconnect()
+            }
+        }
+    }
+
+    func testDisconnectWhileTheRepoIsToldEndsTheConnect() async throws {
+        server.stop()
+        let peer = SyncV1Msg.PeerMsg(senderId: "server", targetId: "client", storageId: nil)
+        server = try SilentWebSocketServer(replyToFirstMessage: try SyncV1Msg.encode(peer))
+        let url = try await server.start()
+
+        let provider = WebSocketProvider(.init(reconnectOnError: true))
+        await provider.setDelegate(DisconnectingReceiver(provider: provider), as: "client", with: nil)
+
+        // returns normally: the disconnect, not a failure, ended the attempt
+        try await provider.connect(to: url)
+
+        let state = await provider.state
+        XCTAssertEqual(state, .disconnected)
+        let peered = await provider.peered
+        XCTAssertFalse(peered)
+        let peers = await provider.peeredConnections
+        XCTAssertTrue(peers.isEmpty)
+        let socket = await provider.webSocketTask
+        XCTAssertNil(socket)
+        // nothing was left running or retrying
+        let loop = await provider.ongoingReceiveMessageTask
+        XCTAssertNil(loop)
+    }
 }

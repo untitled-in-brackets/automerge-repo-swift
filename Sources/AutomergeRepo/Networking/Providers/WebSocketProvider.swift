@@ -95,6 +95,8 @@ public final class WebSocketProvider: NetworkProvider {
     ///
     /// Cancelling the task that awaits this ends the attempt and closes its socket: it throws
     /// `CancellationError`, starts no reconnection and leaves ``WebSocketProviderState/disconnected``.
+    /// A ``disconnect()`` that lands while the handshake's result is being delivered to the repo ends the
+    /// attempt the same way, except that `connect` returns normally.
     public func connect(to makeRequest: @escaping @Sendable () async throws -> URLRequest) async throws {
         switch state {
         case .ready, .connected:
@@ -142,7 +144,6 @@ public final class WebSocketProvider: NetworkProvider {
             return
         }
 
-        assert(peered == true)
         startReceiveLoop(reconnectAttempts: 0)
     }
 
@@ -361,6 +362,14 @@ public final class WebSocketProvider: NetworkProvider {
             self.webSocketTask = webSocketTask
 
             await delegate.receiveEvent(event: .ready(payload: peerConnectionDetails), from: self)
+            // telling the delegate suspended this actor: a disconnect() that landed meanwhile has
+            // already torn the connection down, so there is nothing left to peer or to retry
+            guard peered else {
+                if config.logLevel.canTrace() {
+                    Logger.websocket.trace("WEBSOCKET: disconnected while peering with \(url, privacy: .public)")
+                }
+                return false
+            }
             _statePublisher.send(.ready)
             if config.logLevel.canTrace() {
                 Logger.websocket.trace("WEBSOCKET: Peered to targetId: \(peerMsg.senderId) \(peerMsg.debugDescription)")

@@ -2,14 +2,17 @@ import Foundation
 import Network
 
 /// A local listener that accepts WebSocket upgrades and then never sends anything, which is how a
-/// server that takes the join and does not answer looks to a client.
+/// server that takes the join and does not answer looks to a client. With `replyToFirstMessage` set
+/// it answers each client's first message with that frame, then stays silent.
 final class SilentWebSocketServer: @unchecked Sendable {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "SilentWebSocketServer")
+    private let replyToFirstMessage: Data?
     // only touched on `queue`
     private var connections: [NWConnection] = []
 
-    init() throws {
+    init(replyToFirstMessage: Data? = nil) throws {
+        self.replyToFirstMessage = replyToFirstMessage
         let parameters = NWParameters.tcp
         parameters.acceptLocalOnly = true
         parameters.defaultProtocolStack.applicationProtocols.insert(NWProtocolWebSocket.Options(), at: 0)
@@ -27,6 +30,14 @@ final class SilentWebSocketServer: @unchecked Sendable {
             guard let self else { return }
             connections.append(connection)
             connection.start(queue: queue)
+            if let reply = replyToFirstMessage {
+                connection.receiveMessage { _, _, _, error in
+                    guard error == nil else { return }
+                    let metadata = NWProtocolWebSocket.Metadata(opcode: .binary)
+                    let context = NWConnection.ContentContext(identifier: "reply", metadata: [metadata])
+                    connection.send(content: reply, contentContext: context, completion: .idempotent)
+                }
+            }
         }
         let port: NWEndpoint.Port = try await withCheckedThrowingContinuation { continuation in
             listener.stateUpdateHandler = { [listener] state in
