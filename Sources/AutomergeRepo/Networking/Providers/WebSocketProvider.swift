@@ -92,6 +92,9 @@ public final class WebSocketProvider: NetworkProvider {
     /// ``WebSocketProviderState/reconnecting``. Otherwise a failed first attempt throws. Calling this
     /// while a reconnection is pending attempts immediately instead of waiting out the backoff; while
     /// peered or mid-handshake it does nothing.
+    ///
+    /// Cancelling the task that awaits this ends the attempt and closes its socket: it throws
+    /// `CancellationError`, starts no reconnection and leaves ``WebSocketProviderState/disconnected``.
     public func connect(to makeRequest: @escaping @Sendable () async throws -> URLRequest) async throws {
         switch state {
         case .ready, .connected:
@@ -128,7 +131,8 @@ public final class WebSocketProvider: NetworkProvider {
                 endpoint = nil
                 lastRejection = error as? Errors.ConnectionRejected
                 _statePublisher.send(.disconnected)
-                throw error
+                // the socket a cancel closed fails with whatever error the transport gives
+                throw Task.isCancelled ? CancellationError() : error
             }
             Logger.websocket.warning(
                 "WEBSOCKET: initial connection failed, retrying in the background: \(error.localizedDescription, privacy: .public)"
@@ -298,6 +302,7 @@ public final class WebSocketProvider: NetworkProvider {
 
         // establish the WebSocket connection
 
+        try Task.checkCancellation()
         let webSocketTask = URLSession.shared.webSocketTask(with: request)
         if config.logLevel.canTrace() {
             Logger.websocket.trace("WEBSOCKET: Activating websocket to \(url, privacy: .public)")
@@ -310,9 +315,13 @@ public final class WebSocketProvider: NetworkProvider {
         let joinMessage = SyncV1Msg.JoinMsg(senderId: peerId, metadata: peerMetadata)
         let data = try SyncV1Msg.encode(joinMessage)
         do {
-            try await webSocketTask.send(.data(data))
+            try await Self.endingOnCancel(webSocketTask) {
+                try await webSocketTask.send(.data(data))
+            }
         } catch {
             webSocketTask.cancel()
+            // a cancel closed the socket mid-send; a completed upgrade would otherwise read as HTTP 101
+            try Task.checkCancellation()
             // a refused upgrade fails the first send; the task still holds the HTTP response
             if let status = (webSocketTask.response as? HTTPURLResponse)?.statusCode {
                 Logger.websocket.error("WEBSOCKET: \(url.absoluteString, privacy: .public) refused the upgrade: HTTP \(status)")
@@ -326,6 +335,8 @@ public final class WebSocketProvider: NetworkProvider {
             // of the WebSocket connection. If we fail that race, shut down the connection
             // and move into a .closed connectionState
             let websocketMsg = try await nextMessage(on: webSocketTask, withTimeout: .seconds(3.5))
+            // a cancel that raced the reply must not peer
+            try Task.checkCancellation()
 
             // Now that we have the WebSocket message, figure out if we got what we expected.
             // For the sync protocol handshake phase, it's essentially "peer or die" since
@@ -357,15 +368,27 @@ public final class WebSocketProvider: NetworkProvider {
         } catch {
             // Only this attempt's socket is ours to clean up; shared state, reconnection and the
             // published state are the caller's, and another connect() may have peered meanwhile.
-            Logger.websocket
-                .error(
-                    "WEBSOCKET: Failed to peer with \(url.absoluteString, privacy: .public): \(error.localizedDescription, privacy: .public)"
-                )
+            if !Task.isCancelled {
+                Logger.websocket
+                    .error(
+                        "WEBSOCKET: Failed to peer with \(url.absoluteString, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    )
+            }
             webSocketTask.cancel()
             throw error
         }
 
         return true
+    }
+
+    /// Runs `operation`, cancelling `socket` if the task is cancelled first. The async `send` and
+    /// `receive` do not end when the task awaiting them is cancelled; cancelling the socket ends them.
+    private nonisolated static func endingOnCancel<T: Sendable>(
+        _ socket: URLSessionWebSocketTask, _ operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withTaskCancellationHandler(operation: operation) {
+            socket.cancel(with: .goingAway, reason: nil)
+        }
     }
 
     // throw error on timeout
@@ -394,8 +417,11 @@ public final class WebSocketProvider: NetworkProvider {
         // and move into a .closed connectionState
         let websocketMsg = try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
             group.addTask {
-                // retrieve the next websocket message
-                try await webSocketTask.receive()
+                // retrieve the next websocket message; the group cancels this child when the timer
+                // wins or the caller is cancelled, and it has to end for the group to return
+                try await Self.endingOnCancel(webSocketTask) {
+                    try await webSocketTask.receive()
+                }
             }
 
             group.addTask {
