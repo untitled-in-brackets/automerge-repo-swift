@@ -13,6 +13,7 @@ public final class ControllableStorage: StorageProvider {
     public nonisolated let id: STORAGE_ID = UUID().uuidString
     private let backing = InMemoryStorage()
     private var writeDelays: [Duration] = []
+    private var loadDelays: [Duration] = []
     private var failWrites = false
     public private(set) var writeCount = 0
 
@@ -21,6 +22,11 @@ public final class ControllableStorage: StorageProvider {
     /// Delays consumed in order by the next writes; a write with no queued delay runs immediately.
     public func queueWriteDelays(_ delays: [Duration]) {
         writeDelays.append(contentsOf: delays)
+    }
+
+    /// Delays consumed in order by the next `load` calls; a load with no queued delay runs immediately.
+    public func queueLoadDelays(_ delays: [Duration]) {
+        loadDelays.append(contentsOf: delays)
     }
 
     public func setWritesFail(_ fail: Bool) {
@@ -41,7 +47,13 @@ public final class ControllableStorage: StorageProvider {
     }
 
     public func load(id: DocumentId) async throws -> Data? {
-        await backing.load(id: id)
+        if !loadDelays.isEmpty {
+            let delay = loadDelays.removeFirst()
+            if delay > .zero {
+                try await Task.sleep(for: delay)
+            }
+        }
+        return await backing.load(id: id)
     }
 
     public func save(id: DocumentId, data: Data) async throws {
